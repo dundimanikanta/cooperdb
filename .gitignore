@@ -1,0 +1,17 @@
+# Binaries and build output
+/cooperdb
+*.exe
+*.out
+
+# Test and profiling artifacts
+*.test
+*.prof
+coverage.out
+
+# Data directories produced by running the engine
+/data/
+*.cask
+*.hint
+
+# macOS
+.DS_Store
