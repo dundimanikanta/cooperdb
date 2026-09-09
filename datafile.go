@@ -2,6 +2,7 @@ package cooperdb
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -92,4 +93,27 @@ func (d *DataFile) Sync() error {
 func (d *DataFile) Close() error {
 	// releases the descriptor only; closing does not imply Sync
 	return d.file.Close()
+}
+
+// ReadAt reads the single record of the given size starting at offset, and
+// decodes it. Both values come from the keydir, which recorded them when the
+// record was written.
+func (d *DataFile) ReadAt(offset int64, size int) (*Record, error) {
+	// the length of the buffer is the read request; ReadAt fills exactly len(b)
+	b := make([]byte, size)
+
+	n, err := d.file.ReadAt(b, offset)
+	if err != nil {
+		return nil, err
+	}
+
+	// belt-and-braces: *os.File already errors whenever n < len(b), but the
+	// io.ReaderAt contract itself is looser
+	if n != size {
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	// Decode verifies the crc, so a corrupt record fails here rather than
+	// surfacing as a plausible-looking value
+	return Decode(b)
 }
