@@ -2,6 +2,8 @@ package cooperdb
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -202,5 +204,91 @@ func TestAppendedBytesDecode(t *testing.T) {
 
 	if !bytes.Equal(decoded.Value, r.Value) {
 		t.Errorf("Value = %q, want %q", decoded.Value, r.Value)
+	}
+}
+
+// TestReadAtRoundTrip reads each record back by the offset its Append returned.
+// Landing on the middle one is the point — not just the record at the front.
+func TestReadAtRoundTrip(t *testing.T) {
+	file, err := OpenDataFile(t.TempDir(), 45)
+	if err != nil {
+		t.Fatalf("OpenDataFile failed: %v", err)
+	}
+
+	// different lengths, so a wrong size can't accidentally work
+	records := []*Record{
+		{Timestamp: time.Now().UnixNano(), Key: []byte("user:1"), Value: []byte("alice")},
+		{Timestamp: time.Now().UnixNano(), Key: []byte("user:22"), Value: []byte("bob")},
+		{Timestamp: time.Now().UnixNano(), Key: []byte("user:333"), Value: []byte("carol-longer")},
+	}
+
+	// what the keydir would hold: where each record starts and how big it is
+	offsets := make([]int64, len(records))
+	sizes := make([]int, len(records))
+
+	for i, r := range records {
+		offset, err := file.Append(r)
+		if err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+
+		offsets[i] = offset
+		sizes[i] = RecordSize(len(r.Key), len(r.Value))
+	}
+
+	// out of write order, so reading sequentially from the front can't pass
+	for _, i := range []int{1, 2, 0} {
+		want := records[i]
+
+		got, err := file.ReadAt(offsets[i], sizes[i])
+		if err != nil {
+			t.Fatalf("ReadAt record %d failed: %v", i, err)
+		}
+
+		if got.Timestamp != want.Timestamp {
+			t.Errorf("record %d: Timestamp = %d, want %d", i, got.Timestamp, want.Timestamp)
+		}
+
+		if !bytes.Equal(got.Key, want.Key) {
+			t.Errorf("record %d: Key = %q, want %q", i, got.Key, want.Key)
+		}
+
+		if !bytes.Equal(got.Value, want.Value) {
+			t.Errorf("record %d: Value = %q, want %q", i, got.Value, want.Value)
+		}
+	}
+}
+
+// TestReadAtPastEOF asks for a record beyond the end of the file: an error, not
+// a panic. This is the shape the recovery scan hits on a torn final write.
+func TestReadAtPastEOF(t *testing.T) {
+	file, err := OpenDataFile(t.TempDir(), 45)
+	if err != nil {
+		t.Fatalf("OpenDataFile failed: %v", err)
+	}
+
+	r := &Record{
+		Timestamp: time.Now().UnixNano(),
+		Key:       []byte("user:1"),
+		Value:     []byte("alice"),
+	}
+
+	_, err = file.Append(r)
+	if err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	// one whole record past the only record in the file
+	size := RecordSize(len(r.Key), len(r.Value))
+	pastEnd := int64(size)
+
+	got, err := file.ReadAt(pastEnd, size)
+	if err == nil {
+		t.Fatalf("ReadAt past EOF returned %+v, want an error", got)
+	}
+
+	// either EOF flavour is correct here; a nil error is not
+	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("err = %v, want io.EOF or io.ErrUnexpectedEOF", err)
 	}
 }
