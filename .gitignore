@@ -13,5 +13,8 @@ coverage.out
 *.cask
 *.hint
 
+# Personal study notes, not part of the engine
+/notes.md
+
 # macOS
 .DS_Store
