@@ -127,6 +127,54 @@ func TestShortBuffer(t *testing.T) {
 	}
 }
 
+// TestTombstoneRoundTrip checks the flags byte survives Encode/Decode and that
+// IsTombstone reads it back.
+func TestTombstoneRoundTrip(t *testing.T) {
+
+	r := &Record{
+		Timestamp: time.Now().UnixNano(),
+		Flags:     flagTombstone,
+		Key:       []byte("user:1"),
+	}
+
+	encoded := r.Encode()
+	decoded, err := Decode(encoded)
+
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if decoded.Flags != r.Flags {
+		t.Errorf("Flags = %08b, want %08b", decoded.Flags, r.Flags)
+	}
+
+	if !decoded.IsTombstone() {
+		t.Errorf("IsTombstone = false, want true")
+	}
+}
+
+// TestEmptyValueIsNotTombstone is the reason the flag byte exists: a record
+// storing an empty value and a record marking a deletion must not look alike.
+func TestEmptyValueIsNotTombstone(t *testing.T) {
+
+	r := &Record{
+		Timestamp: time.Now().UnixNano(),
+		Key:       []byte("user:1"),
+		Value:     []byte{},
+	}
+
+	encoded := r.Encode()
+	decoded, err := Decode(encoded)
+
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if decoded.IsTombstone() {
+		t.Errorf("IsTombstone = true for an empty value, want false")
+	}
+}
+
 // TestEncodedSize checks that Encode and RecordSize agree on a record's
 // length, since the keydir relies on RecordSize to read the right byte count.
 func TestEncodedSize(t *testing.T) {

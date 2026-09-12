@@ -9,8 +9,16 @@ import (
 
 // headerSize is the fixed prefix on every record:
 //
-//	crc (4) + timestamp (8) + keySize (4) + valueSize (4)
-const headerSize = 20
+//	crc (4) + timestamp (8) + keySize (4) + valueSize (4) + flags (1)
+const headerSize = 21
+
+// Bits in a record's flags byte. Seven are still free.
+//
+// The flag lives inside the crc's range, so a bit flipped on disk fails the
+// checksum rather than silently turning a live record into a tombstone.
+const (
+	flagTombstone uint8 = 1 << 0
+)
 
 var (
 	ErrCorruptRecord = errors.New("cooperdb: crc mismatch")
@@ -20,8 +28,16 @@ var (
 // Record is one entry as it exists in memory.
 type Record struct {
 	Timestamp int64
+	Flags     uint8
 	Key       []byte
 	Value     []byte
+}
+
+// IsTombstone reports whether this record marks its key as deleted. A tombstone
+// is distinguished by the flag, not by an empty value — storing an empty value
+// is a legitimate write, and the two must stay tellable apart during recovery.
+func (r *Record) IsTombstone() bool {
+	return r.Flags&flagTombstone != 0
 }
 
 // Encode lays r out as: header | key | value
@@ -32,8 +48,9 @@ type Record struct {
 //	[4:12]  timestamp
 //	[12:16] len(Key)
 //	[16:20] len(Value)
-//	[20:20+keySize]              key bytes
-//	[20+keySize:20+keySize+valSize] value bytes
+//	[20:21] flags
+//	[21:21+keySize]              key bytes
+//	[21+keySize:21+keySize+valSize] value bytes
 func (r *Record) Encode() []byte {
 
 	//allocating a slice of length headerSize + len(r.Key) + len(r.Value)
@@ -46,8 +63,11 @@ func (r *Record) Encode() []byte {
 	binary.LittleEndian.PutUint32(buf[12:16], uint32(len(r.Key)))
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(r.Value)))
 
-	// copying r.Key in starting at offset 20
-	// copying r.Value in starting at offset 20+len(r.Key)
+	//writing the flags byte into [20:21]
+	buf[20] = r.Flags
+
+	// copying r.Key in starting at offset 21
+	// copying r.Value in starting at offset 21+len(r.Key)
 	copy(buf[headerSize:], r.Key)
 	copy(buf[headerSize+len(r.Key):], r.Value)
 
@@ -69,10 +89,12 @@ func Decode(b []byte) (*Record, error) {
 		return nil, ErrShortRecord
 	}
 
-	// reading timestamp from [4:12], key size from [12:16], value size from [16:20]
+	// reading timestamp from [4:12], key size from [12:16], value size from
+	// [16:20], flags from [20:21]
 	timestamp := binary.LittleEndian.Uint64(b[4:12])
 	keySize := binary.LittleEndian.Uint32(b[12:16])
 	valueSize := binary.LittleEndian.Uint32(b[16:20])
+	flags := b[20]
 
 	// The sizes are still unverified here — the crc can't be checked until they
 	// tell us where the record ends. Summing as uint64 keeps two near-max sizes
@@ -97,6 +119,7 @@ func Decode(b []byte) (*Record, error) {
 
 	return &Record{
 		Timestamp: int64(timestamp),
+		Flags:     flags,
 		Key:       key,
 		Value:     value,
 	}, nil

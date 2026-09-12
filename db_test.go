@@ -200,6 +200,152 @@ func TestDBPut100Keys(t *testing.T) {
 	}
 }
 
+// TestDBDelete stores a key, deletes it, and checks it stops resolving.
+func TestDBDelete(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	key := []byte("user:1")
+
+	err = db.Put(key, []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	err = db.Delete(key)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	_, err = db.Get(key)
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("Get after Delete: err = %v, want ErrKeyNotFound", err)
+	}
+
+	if db.keyDirectory.Len() != 0 {
+		t.Errorf("keydir Len = %d, want 0", db.keyDirectory.Len())
+	}
+}
+
+// TestDBDeleteAppendsTombstone checks that the delete was written, not just
+// applied in memory: the file has to grow, or a restart would resurrect the key.
+func TestDBDeleteAppendsTombstone(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	key := []byte("user:1")
+
+	err = db.Put(key, []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	afterPut := db.dataFile.offset
+
+	err = db.Delete(key)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	// a tombstone is header + key, with no value
+	want := afterPut + int64(RecordSize(len(key), 0))
+	if db.dataFile.offset != want {
+		t.Errorf("offset after Delete = %d, want %d", db.dataFile.offset, want)
+	}
+}
+
+// TestDBDeleteMissing deletes a key that was never stored. It must not error.
+func TestDBDeleteMissing(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Delete([]byte("nope"))
+	if err != nil {
+		t.Errorf("Delete of an absent key returned %v, want nil", err)
+	}
+
+	if db.keyDirectory.Len() != 0 {
+		t.Errorf("keydir Len = %d, want 0", db.keyDirectory.Len())
+	}
+}
+
+// TestDBDeleteThenPut brings a deleted key back. Nothing about a tombstone is
+// permanent — it is just the newest record for that key until another one lands.
+func TestDBDeleteThenPut(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	key := []byte("user:1")
+
+	err = db.Put(key, []byte("alice"))
+	if err != nil {
+		t.Fatalf("first Put failed: %v", err)
+	}
+
+	err = db.Delete(key)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	err = db.Put(key, []byte("alice-again"))
+	if err != nil {
+		t.Fatalf("second Put failed: %v", err)
+	}
+
+	got, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if !bytes.Equal(got, []byte("alice-again")) {
+		t.Errorf("Get = %q, want %q", got, "alice-again")
+	}
+}
+
+// TestDBDeleteOneOfMany checks a delete touches only its own key.
+func TestDBDeleteOneOfMany(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put user:1 failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:2"), []byte("bob"))
+	if err != nil {
+		t.Fatalf("Put user:2 failed: %v", err)
+	}
+
+	err = db.Delete([]byte("user:1"))
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	got, err := db.Get([]byte("user:2"))
+	if err != nil {
+		t.Fatalf("Get user:2 failed: %v", err)
+	}
+
+	if !bytes.Equal(got, []byte("bob")) {
+		t.Errorf("Get user:2 = %q, want %q", got, "bob")
+	}
+
+	if db.keyDirectory.Len() != 1 {
+		t.Errorf("keydir Len = %d, want 1", db.keyDirectory.Len())
+	}
+}
+
 // TestDBPutAfterClose checks that Close actually closed the file: a write to a
 // closed handle must come back as an error rather than being silently dropped.
 func TestDBPutAfterClose(t *testing.T) {

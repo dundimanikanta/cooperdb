@@ -92,3 +92,29 @@ func (db *DB) Close() error {
 	// whether a Sync belongs here first is the durability policy question in 2.4
 	return db.dataFile.Close()
 }
+
+// Delete removes key. The record cannot be erased from an append-only file, so
+// a tombstone is appended instead; the keydir drop is what makes the key
+// unreachable now, and the tombstone is what stops recovery resurrecting it.
+func (db *DB) Delete(key []byte) error {
+	tombstone := &Record{
+		Timestamp: time.Now().UnixNano(),
+		// bit 0 set — this is what marks the deletion, not the empty value,
+		// since Put(key, []byte{}) writes an empty value too
+		Flags: flagTombstone,
+		Key:   key,
+		// nothing to store: len(nil) is 0, so this record is header + key only
+		Value: nil,
+	}
+
+	// keydir last: dropping the key before a failed append would leave it gone
+	// in memory but still live on disk, and the next restart would bring it back
+	_, err := db.dataFile.Append(tombstone)
+	if err != nil {
+		return err
+	}
+
+	db.keyDirectory.Delete(key)
+
+	return nil
+}
