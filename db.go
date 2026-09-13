@@ -20,9 +20,7 @@ const (
 // is built, so the zero values in the struct are the defaults.
 type Option func(*DB)
 
-// WithSyncNever leaves flushing entirely to the kernel. Fastest, and a write
-// that has returned is lost if the machine loses power before the kernel
-// writes it back. This is the default.
+// WithSyncNever leaves flushing to the kernel: fastest, loses unflushed writes on power loss. The default.
 func WithSyncNever() Option {
 	return func(db *DB) {
 		db.syncPolicy = SyncNever
@@ -37,10 +35,8 @@ func WithSyncAlways() Option {
 	}
 }
 
-// WithSyncEveryN flushes once every n writes, bounding what a power loss can
-// take to the last n writes. n below 1 is treated as 1, since a zero or
-// negative interval would otherwise mean a counter that never fires — silently
-// turning this into WithSyncNever, which is the one mistake worth ruling out.
+// WithSyncEveryN flushes every n writes, so a power loss takes at most the last n.
+// n below 1 clamps to 1: a counter that never fires would silently mean SyncNever.
 func WithSyncEveryN(n int) Option {
 	if n < 1 {
 		n = 1
@@ -55,26 +51,13 @@ func WithSyncEveryN(n int) Option {
 // DB is the public handle: a keydir in memory over one or more data files on
 // disk. Every write appends to the active file and updates the keydir.
 type DB struct {
-	// held for rotation (2.6), which needs somewhere to create the next file
-	directory string
-
-	// the file every write is appended to
-	dataFile *DataFile
-
-	// where each live key's newest record can be found
-	keyDirectory *KeyDir
-
-	// when to flush; the zero value is SyncNever
-	syncPolicy SyncPolicy
-
-	// the flush interval, only meaningful under SyncEveryN
-	syncEveryN int
-
-	// carrying the writes count from last sync used only when under SyncEveryN
-	writeCount int
-
-	// defining the poisoned to store when error is retuned during the sync
-	poisoned error
+	directory    string     // where data files live; rotation (2.6) creates the next one here
+	dataFile     *DataFile  // the file every write is appended to
+	keyDirectory *KeyDir    // where each live key's newest record can be found
+	syncPolicy   SyncPolicy // when to flush; the zero value is SyncNever
+	syncEveryN   int        // the flush interval, only meaningful under SyncEveryN
+	writeCount   int        // writes since the last flush, only used under SyncEveryN
+	poisoned     error      // set once a sync fails, and never cleared
 }
 
 // Open prepares the database in dir for use. Called with no options it syncs
@@ -110,9 +93,6 @@ func Open(dir string, opts ...Option) (*DB, error) {
 }
 
 // syncAsPerPolicy flushes the data file if the configured policy calls for it.
-// A failed sync poisons the DB permanently: it is never retried, because a
-// failed fsync can leave the kernel treating the pages as clean, so a second
-// call would report success over data that is already gone.
 func (db *DB) syncAsPerPolicy() error {
 	switch db.syncPolicy {
 
@@ -142,9 +122,10 @@ func (db *DB) syncAsPerPolicy() error {
 	return nil
 }
 
-// sync flushes the data file and records any failure as permanent.
-// Every path that flushes goes through here, so there is exactly one place
-// the database can become poisoned.
+// sync flushes the data file and records any failure as permanent — the one
+// place the database can become poisoned. Never retried: a failed fsync can
+// leave the kernel marking the pages clean, so a second call would report
+// success over data that is already gone.
 func (db *DB) sync() error {
 	err := db.dataFile.Sync()
 
@@ -217,12 +198,8 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return r.Value, nil
 }
 
-// Close flushes the active data file and closes it. The flush happens whatever
-// the policy says: SyncNever means the kernel decides while the process runs,
-// not that a clean shutdown is allowed to lose writes.
-//
-// There is deliberately no poisoned check — a database that cannot be closed is
-// a database whose descriptor leaks, so shutting down always has to be allowed.
+// Close flushes the data file whatever the policy says, then closes it. No
+// poisoned check: a database that cannot be closed is one whose descriptor leaks.
 func (db *DB) Close() error {
 	syncErr := db.sync()
 
@@ -239,9 +216,8 @@ func (db *DB) Close() error {
 	return closeErr
 }
 
-// Delete removes key. The record cannot be erased from an append-only file, so
-// a tombstone is appended instead; the keydir drop is what makes the key
-// unreachable now, and the tombstone is what stops recovery resurrecting it.
+// Delete removes key by appending a tombstone, since an append-only file cannot
+// erase. The keydir drop hides it now; the tombstone stops recovery reviving it.
 func (db *DB) Delete(key []byte) error {
 	// a delete is a write, so it is refused for the same reason a Put is
 	if db.poisoned != nil {
