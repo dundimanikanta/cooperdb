@@ -364,3 +364,228 @@ func TestDBPutAfterClose(t *testing.T) {
 		t.Errorf("Put after Close returned nil, want an error")
 	}
 }
+
+// TestDBDefaultSyncPolicyIsNever checks that opening with no options leaves the
+// policy at the zero value, so adding the option machinery changed no behaviour.
+func TestDBDefaultSyncPolicyIsNever(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if db.syncPolicy != SyncNever {
+		t.Errorf("syncPolicy = %d, want %d (SyncNever)", db.syncPolicy, SyncNever)
+	}
+}
+
+// TestDBWithSyncAlways checks the option reaches the DB.
+func TestDBWithSyncAlways(t *testing.T) {
+	db, err := Open(t.TempDir(), WithSyncAlways())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if db.syncPolicy != SyncAlways {
+		t.Errorf("syncPolicy = %d, want %d (SyncAlways)", db.syncPolicy, SyncAlways)
+	}
+}
+
+// TestDBWithSyncEveryN checks the option sets both the policy and its interval,
+// which is the reason the two travel together in one option.
+func TestDBWithSyncEveryN(t *testing.T) {
+	db, err := Open(t.TempDir(), WithSyncEveryN(100))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if db.syncPolicy != SyncEveryN {
+		t.Errorf("syncPolicy = %d, want %d (SyncEveryN)", db.syncPolicy, SyncEveryN)
+	}
+
+	if db.syncEveryN != 100 {
+		t.Errorf("syncEveryN = %d, want 100", db.syncEveryN)
+	}
+}
+
+// TestDBWithSyncEveryNClampsBelowOne checks that an interval under 1 becomes 1.
+// Left alone it would be a counter that never fires — durability silently turned
+// off for someone who asked for it.
+func TestDBWithSyncEveryNClampsBelowOne(t *testing.T) {
+	db, err := Open(t.TempDir(), WithSyncEveryN(0))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if db.syncEveryN != 1 {
+		t.Errorf("syncEveryN = %d, want 1", db.syncEveryN)
+	}
+}
+
+// TestDBLastSyncOptionWins pins the behaviour of conflicting options, since
+// Open applies them in order and nothing rejects a contradiction.
+func TestDBLastSyncOptionWins(t *testing.T) {
+	db, err := Open(t.TempDir(), WithSyncAlways(), WithSyncNever())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if db.syncPolicy != SyncNever {
+		t.Errorf("syncPolicy = %d, want %d (SyncNever, the last option)", db.syncPolicy, SyncNever)
+	}
+}
+
+// TestDBSyncEveryNResetsCounter follows writeCount across an interval boundary.
+// Without the reset the counter would stay above the interval and flush on every
+// write from then on, quietly turning SyncEveryN into SyncAlways.
+func TestDBSyncEveryNResetsCounter(t *testing.T) {
+	db, err := Open(t.TempDir(), WithSyncEveryN(3))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// two writes short of the interval
+	for i := 0; i < 2; i++ {
+		err = db.Put([]byte(fmt.Sprintf("user:%d", i)), []byte("alice"))
+		if err != nil {
+			t.Fatalf("Put %d failed: %v", i, err)
+		}
+	}
+
+	if db.writeCount != 2 {
+		t.Errorf("writeCount after 2 writes = %d, want 2", db.writeCount)
+	}
+
+	// the third write reaches the interval and flushes
+	err = db.Put([]byte("user:2"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("third Put failed: %v", err)
+	}
+
+	if db.writeCount != 0 {
+		t.Errorf("writeCount after the flush = %d, want 0", db.writeCount)
+	}
+
+	// and counting starts again rather than staying past the interval
+	err = db.Put([]byte("user:3"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("fourth Put failed: %v", err)
+	}
+
+	if db.writeCount != 1 {
+		t.Errorf("writeCount after the next write = %d, want 1", db.writeCount)
+	}
+}
+
+// TestDBWorksUnderEachSyncPolicy checks the policy changes only durability, not
+// behaviour: the same writes and reads have to work under all three.
+func TestDBWorksUnderEachSyncPolicy(t *testing.T) {
+	policies := []struct {
+		name string
+		opt  Option
+	}{
+		{"SyncNever", WithSyncNever()},
+		{"SyncAlways", WithSyncAlways()},
+		{"SyncEveryN", WithSyncEveryN(2)},
+	}
+
+	for _, p := range policies {
+		db, err := Open(t.TempDir(), p.opt)
+		if err != nil {
+			t.Fatalf("%s: Open failed: %v", p.name, err)
+		}
+
+		err = db.Put([]byte("user:1"), []byte("alice"))
+		if err != nil {
+			t.Fatalf("%s: Put failed: %v", p.name, err)
+		}
+
+		got, err := db.Get([]byte("user:1"))
+		if err != nil {
+			t.Fatalf("%s: Get failed: %v", p.name, err)
+		}
+
+		if !bytes.Equal(got, []byte("alice")) {
+			t.Errorf("%s: Get = %q, want %q", p.name, got, "alice")
+		}
+
+		err = db.Delete([]byte("user:1"))
+		if err != nil {
+			t.Fatalf("%s: Delete failed: %v", p.name, err)
+		}
+
+		_, err = db.Get([]byte("user:1"))
+		if !errors.Is(err, ErrKeyNotFound) {
+			t.Errorf("%s: Get after Delete = %v, want ErrKeyNotFound", p.name, err)
+		}
+	}
+}
+
+// TestDBPoisonedRefusesOperations is the point of the poisoning rule: once a
+// sync has failed, what is on disk is unknown, so every later call is refused
+// with the original failure rather than being served a maybe-stale answer.
+func TestDBPoisonedRefusesOperations(t *testing.T) {
+	db, err := Open(t.TempDir(), WithSyncAlways())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// closing the handle underneath is the cheapest way to make a real Sync fail
+	err = db.dataFile.Close()
+	if err != nil {
+		t.Fatalf("closing the data file failed: %v", err)
+	}
+
+	syncErr := db.sync()
+	if syncErr == nil {
+		t.Fatalf("sync on a closed file returned nil, want an error")
+	}
+
+	if db.poisoned == nil {
+		t.Fatalf("poisoned is nil after a failed sync")
+	}
+
+	// every entry point refuses, and reports the original cause
+	err = db.Put([]byte("user:2"), []byte("bob"))
+	if !errors.Is(err, syncErr) {
+		t.Errorf("Put on a poisoned DB = %v, want %v", err, syncErr)
+	}
+
+	_, err = db.Get([]byte("user:1"))
+	if !errors.Is(err, syncErr) {
+		t.Errorf("Get on a poisoned DB = %v, want %v", err, syncErr)
+	}
+
+	err = db.Delete([]byte("user:1"))
+	if !errors.Is(err, syncErr) {
+		t.Errorf("Delete on a poisoned DB = %v, want %v", err, syncErr)
+	}
+}
+
+// TestDBCloseOnPoisonedDB checks that shutdown is never refused. A database that
+// cannot be closed is one whose file descriptor leaks.
+func TestDBCloseOnPoisonedDB(t *testing.T) {
+	db, err := Open(t.TempDir(), WithSyncAlways())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.dataFile.Close()
+	if err != nil {
+		t.Fatalf("closing the data file failed: %v", err)
+	}
+
+	if db.sync() == nil {
+		t.Fatalf("sync on a closed file returned nil, want an error")
+	}
+
+	// Close still runs, and reports the sync failure rather than swallowing it
+	err = db.Close()
+	if err == nil {
+		t.Errorf("Close on a poisoned DB returned nil, want the sync error")
+	}
+}
