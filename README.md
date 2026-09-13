@@ -26,10 +26,32 @@ err = db.Close()
 - In-memory keydir mapping each live key to its newest record
 - `Put` / `Get` / `Delete`, the last writing a tombstone rather than erasing
 - A configurable flush policy, measured below
+- Recovery on `Open` — the keydir is rebuilt from the log, so data survives a
+  restart
 
-Not yet: rebuilding the keydir on restart, compaction, and concurrent access.
-Until recovery lands, reopening a directory that already holds records will not
-find them.
+Not yet: file rotation, compaction, and concurrent access.
+
+## Recovery
+
+The keydir lives only in memory. `Open` reconstructs it by replaying every data
+file, which is what makes a write survive the process that made it.
+
+Replay walks files in creation order and records in offset order, so the last
+record to touch a key is the one that wins. Filenames are zero-padded
+(`000009.data`, `000010.data`) precisely so a text sort gives that order. A
+tombstone removes its key instead of storing an entry, which is why deletions do
+not come back.
+
+Every record carries its own timestamp, and a record older than the entry
+already held is skipped. That is redundant while replay order matches write
+order — it stops being redundant once compaction rewrites old records into newly
+created files, at which point file order no longer implies record age.
+
+**A damaged tail ends the scan rather than failing the open.** A process killed
+mid-write leaves a partial record at the end of the active file; everything
+before it is intact, so recovery takes what it can read and stops. Treating that
+as corruption would make a single ungraceful shutdown render the database
+permanently unopenable.
 
 ## Record format
 
