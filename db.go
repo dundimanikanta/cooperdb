@@ -72,7 +72,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 
 	// appends continue into the newest file, and OpenDataFile seeds its write
 	// offset from the file's size so they land after the records already there
-	dataf, err := OpenDataFile(dir, activeID)
+	dataf, err := OpenDataFile(dir, activeID, createIfMissing)
 	if err != nil {
 		return nil, err
 	}

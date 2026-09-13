@@ -12,7 +12,7 @@ func TestDataFileIDsOrdering(t *testing.T) {
 	dir := t.TempDir()
 
 	for _, id := range []uint32{9, 10, 2, 0} {
-		df, err := OpenDataFile(dir, id)
+		df, err := OpenDataFile(dir, id, createIfMissing)
 		if err != nil {
 			t.Fatalf("OpenDataFile %d failed: %v", id, err)
 		}
@@ -46,7 +46,7 @@ func TestDataFileIDsOrdering(t *testing.T) {
 func TestDataFileIDsIgnoresOtherFiles(t *testing.T) {
 	dir := t.TempDir()
 
-	df, err := OpenDataFile(dir, 0)
+	df, err := OpenDataFile(dir, 0, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile failed: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestLoadKeyDirAcrossFiles(t *testing.T) {
 	dir := t.TempDir()
 
 	// file 0: two keys
-	df0, err := OpenDataFile(dir, 0)
+	df0, err := OpenDataFile(dir, 0, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile 0 failed: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestLoadKeyDirAcrossFiles(t *testing.T) {
 	}
 
 	// file 1: one key rewritten, the other deleted
-	df1, err := OpenDataFile(dir, 1)
+	df1, err := OpenDataFile(dir, 1, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile 1 failed: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestLoadKeyDirEmptyDir(t *testing.T) {
 func TestLoadKeyDirStopsAtTornTail(t *testing.T) {
 	dir := t.TempDir()
 
-	df, err := OpenDataFile(dir, 0)
+	df, err := OpenDataFile(dir, 0, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile failed: %v", err)
 	}

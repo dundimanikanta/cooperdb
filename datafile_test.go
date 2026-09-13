@@ -14,7 +14,7 @@ import (
 // leaves the gaps between them correct, so only an absolute assertion sees it.
 func TestAppendFirstOffsetIsZero(t *testing.T) {
 	// t.TempDir gives a fresh directory per test, removed automatically after
-	file, err := OpenDataFile(t.TempDir(), 45)
+	file, err := OpenDataFile(t.TempDir(), 45, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile failed: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestAppendFirstOffsetIsZero(t *testing.T) {
 // equal size. Deliberately not written as "each offset is RecordSize past the
 // last", which passes even when every value is wrong.
 func TestAppendOffsetsAreAbsolute(t *testing.T) {
-	file, err := OpenDataFile(t.TempDir(), 45)
+	file, err := OpenDataFile(t.TempDir(), 45, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile failed: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestReopenContinuesOffset(t *testing.T) {
 	dir := t.TempDir()
 	const id = 45
 
-	file, err := OpenDataFile(dir, id)
+	file, err := OpenDataFile(dir, id, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile failed: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestReopenContinuesOffset(t *testing.T) {
 	}
 
 	// same dir, same id — this reopen is the thing under test
-	reopened, err := OpenDataFile(dir, id)
+	reopened, err := OpenDataFile(dir, id, createIfMissing)
 	if err != nil {
 		t.Fatalf("reopening failed: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestReopenContinuesOffset(t *testing.T) {
 // TestAppendedBytesDecode reads the file back through the codec — the first
 // end-to-end check that what Append writes is what Decode can read.
 func TestAppendedBytesDecode(t *testing.T) {
-	file, err := OpenDataFile(t.TempDir(), 45)
+	file, err := OpenDataFile(t.TempDir(), 45, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile failed: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestAppendedBytesDecode(t *testing.T) {
 // TestReadAtRoundTrip reads each record back by the offset its Append returned.
 // Landing on the middle one is the point — not just the record at the front.
 func TestReadAtRoundTrip(t *testing.T) {
-	file, err := OpenDataFile(t.TempDir(), 45)
+	file, err := OpenDataFile(t.TempDir(), 45, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile failed: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestReadAtRoundTrip(t *testing.T) {
 // TestReadAtPastEOF asks for a record beyond the end of the file: an error, not
 // a panic. This is the shape the recovery scan hits on a torn final write.
 func TestReadAtPastEOF(t *testing.T) {
-	file, err := OpenDataFile(t.TempDir(), 45)
+	file, err := OpenDataFile(t.TempDir(), 45, createIfMissing)
 	if err != nil {
 		t.Fatalf("OpenDataFile failed: %v", err)
 	}

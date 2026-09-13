@@ -14,6 +14,13 @@ import (
 // umask, and only consulted when the file does not already exist.
 const dataFilePerm os.FileMode = 0644
 
+// Arguments for OpenDataFile's create parameter, so a call site says which case
+// it means rather than a bare true or false.
+const (
+	createIfMissing     = true
+	dontCreateIfMissing = false
+)
+
 // DataFile is one append-only log file. Records are only ever added at the
 // end; nothing already written is modified in place.
 //
@@ -26,16 +33,24 @@ type DataFile struct {
 	offset int64
 }
 
-// OpenDataFile opens the data file with the given id inside dir, creating it
-// if it does not exist, and positions the write offset at the end of whatever
-// is already there.
-func OpenDataFile(dir string, id uint32) (*DataFile, error) {
+// OpenDataFile opens the data file with the given id inside dir, positioning the
+// write offset at the end of what is already there. createIfMissing opens it for
+// appending; dontCreateIfMissing opens it read-only and errors when it is absent.
+func OpenDataFile(dir string, id uint32, create bool) (*DataFile, error) {
 	// zero-padded so the filenames sort lexically in creation order
 	path := filepath.Join(dir, fmt.Sprintf("%06d.data", id))
 
-	// O_APPEND sends every write to EOF atomically; O_RDWR because 1.6 reads back
-	// through this same handle
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, dataFilePerm)
+	// O_APPEND sends every write to EOF atomically; O_RDWR because reads come
+	// back through this same handle
+	flags := os.O_CREATE | os.O_RDWR | os.O_APPEND
+
+	// read-only and no O_CREATE: a missing file errors instead of being made
+	// empty, and the kernel refuses a write rather than trusting nobody tries
+	if !create {
+		flags = os.O_RDONLY
+	}
+
+	f, err := os.OpenFile(path, flags, dataFilePerm)
 	if err != nil {
 		return nil, err
 	}

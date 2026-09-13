@@ -58,7 +58,9 @@ func loadKeyDir(dir string) (*KeyDir, uint32, error) {
 
 	// creation order, because a later file's records must land last
 	for _, id := range ids {
-		df, err := OpenDataFile(dir, id)
+		// replay only reads, and dataFileIDs just saw these files, so a missing
+		// one is a real problem rather than something to create and scan empty
+		df, err := OpenDataFile(dir, id, dontCreateIfMissing)
 		if err != nil {
 			return nil, 0, err
 		}
