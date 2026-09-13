@@ -80,15 +80,19 @@ type DB struct {
 // Open prepares the database in dir for use. Called with no options it syncs
 // never, that being the zero value of SyncPolicy.
 func Open(dir string, opts ...Option) (*DB, error) {
-	// file id 0 for now: rotation is 2.6
-	dataf, err := OpenDataFile(dir, 0)
+	// replay whatever is already on disk; an empty directory gives back an
+	// empty keydir and id 0, which is a new database rather than an error
+	keyd, activeID, err := loadKeyDir(dir)
 	if err != nil {
 		return nil, err
 	}
 
-	// starts empty — rebuilding it from files already on disk is 2.5, so until
-	// then reopening a directory with existing records will not find them
-	keyd := NewKeyDir()
+	// appends continue into the newest file, and OpenDataFile seeds its write
+	// offset from the file's size so they land after the records already there
+	dataf, err := OpenDataFile(dir, activeID)
+	if err != nil {
+		return nil, err
+	}
 
 	db := &DB{
 		directory:    dir,

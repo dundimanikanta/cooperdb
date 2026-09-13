@@ -1,6 +1,8 @@
 package cooperdb
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -116,4 +118,79 @@ func (d *DataFile) ReadAt(offset int64, size int) (*Record, error) {
 	// Decode verifies the crc, so a corrupt record fails here rather than
 	// surfacing as a plausible-looking value
 	return Decode(b)
+}
+
+// ScanRecordAt reads the record at offset and reports the bytes it occupied,
+// working its size out from the header instead of being told it. io.EOF ends a
+// scan cleanly.
+func (d *DataFile) ScanRecordAt(offset int64) (*Record, int, error) {
+	// raw bytes, not d.ReadAt: that one decodes, and a header alone never
+	// satisfies Decode, which needs the key and value too
+	header := make([]byte, headerSize)
+
+	// io.EOF covers both "nothing left" and "fewer than a header remains",
+	// since os.File.ReadAt reports EOF for a partial fill as well
+	_, err := d.file.ReadAt(header, offset)
+	if errors.Is(err, io.EOF) {
+		return nil, 0, io.EOF
+	}
+
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// the two size fields sit where Decode reads them from
+	keySize := binary.LittleEndian.Uint32(header[12:16])
+	valueSize := binary.LittleEndian.Uint32(header[16:20])
+
+	// now the size is known, this read goes through the decoding path so the
+	// crc is verified
+	recordSize := RecordSize(int(keySize), int(valueSize))
+
+	record, err := d.ReadAt(offset, recordSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return record, recordSize, nil
+}
+
+// Scan walks every record in the file from the start, calling fn with each one
+// and the offset it was found at. It stops cleanly at the end of the file, and
+// also at the first record that is incomplete or fails its checksum — after a
+// crash the tail of a file is expected to be damaged, and everything before it
+// is still good.
+//
+// fn returning an error stops the scan and passes that error back.
+func (d *DataFile) Scan(fn func(offset int64, r *Record) error) error {
+	// records sit end to end from the start of the file, so the walk begins at 0
+	offset := int64(0)
+
+	for {
+		record, size, err := d.ScanRecordAt(offset)
+
+		// a damaged or half-written tail is what a crash leaves behind, so it
+		// ends the scan rather than failing it — everything before it is good
+		if errors.Is(err, io.EOF) ||
+			errors.Is(err, io.ErrUnexpectedEOF) ||
+			errors.Is(err, ErrShortRecord) ||
+			errors.Is(err, ErrCorruptRecord) {
+			return nil
+		}
+
+		// anything else is a real I/O failure, and recovery should not pretend
+		// it read a whole file when it did not
+		if err != nil {
+			return err
+		}
+
+		// the caller decides what the record means; its error stops the walk
+		err = fn(offset, record)
+		if err != nil {
+			return err
+		}
+
+		// the record just read ends exactly where the next one begins
+		offset += int64(size)
+	}
 }

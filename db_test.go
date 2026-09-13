@@ -589,3 +589,226 @@ func TestDBCloseOnPoisonedDB(t *testing.T) {
 		t.Errorf("Close on a poisoned DB returned nil, want the sync error")
 	}
 }
+
+// TestDBReopenFindsAllKeys is the bar for session 2.5: 100 keys written, the
+// process boundary crossed by closing and reopening, and all 100 read back.
+func TestDBReopenFindsAllKeys(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	const count = 100
+
+	for i := 0; i < count; i++ {
+		key := []byte(fmt.Sprintf("user:%d", i))
+		value := []byte(fmt.Sprintf("value-%d%s", i, strings.Repeat("x", i%7)))
+
+		err = db.Put(key, value)
+		if err != nil {
+			t.Fatalf("Put %d failed: %v", i, err)
+		}
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// a second DB over the same directory, holding nothing the first one knew
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	if reopened.keyDirectory.Len() != count {
+		t.Fatalf("keydir Len after reopen = %d, want %d", reopened.keyDirectory.Len(), count)
+	}
+
+	for i := 0; i < count; i++ {
+		key := []byte(fmt.Sprintf("user:%d", i))
+		want := []byte(fmt.Sprintf("value-%d%s", i, strings.Repeat("x", i%7)))
+
+		got, err := reopened.Get(key)
+		if err != nil {
+			t.Fatalf("Get %q after reopen failed: %v", key, err)
+		}
+
+		if !bytes.Equal(got, want) {
+			t.Errorf("Get %q = %q, want %q", key, got, want)
+		}
+	}
+}
+
+// TestDBReopenAfterOverwrite checks replay picks the newer of two records for
+// the same key rather than whichever it happens to read first.
+func TestDBReopenAfterOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	key := []byte("user:1")
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put(key, []byte("alice"))
+	if err != nil {
+		t.Fatalf("first Put failed: %v", err)
+	}
+
+	err = db.Put(key, []byte("alice-updated"))
+	if err != nil {
+		t.Fatalf("second Put failed: %v", err)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	got, err := reopened.Get(key)
+	if err != nil {
+		t.Fatalf("Get after reopen failed: %v", err)
+	}
+
+	if !bytes.Equal(got, []byte("alice-updated")) {
+		t.Errorf("Get = %q, want %q", got, "alice-updated")
+	}
+
+	// both records are still on disk; only one of them is reachable
+	if reopened.keyDirectory.Len() != 1 {
+		t.Errorf("keydir Len = %d, want 1", reopened.keyDirectory.Len())
+	}
+}
+
+// TestDBReopenAfterDelete is the tombstone's first real job. Without it, replay
+// would find the original record and hand back a key the caller deleted.
+func TestDBReopenAfterDelete(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put user:1 failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:2"), []byte("bob"))
+	if err != nil {
+		t.Fatalf("Put user:2 failed: %v", err)
+	}
+
+	err = db.Delete([]byte("user:1"))
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	_, err = reopened.Get([]byte("user:1"))
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("deleted key after reopen: err = %v, want ErrKeyNotFound", err)
+	}
+
+	got, err := reopened.Get([]byte("user:2"))
+	if err != nil {
+		t.Fatalf("Get user:2 after reopen failed: %v", err)
+	}
+
+	if !bytes.Equal(got, []byte("bob")) {
+		t.Errorf("Get user:2 = %q, want %q", got, "bob")
+	}
+}
+
+// TestDBReopenThenPutAppends checks recovery leaves the write offset at the end
+// of the file. Resuming at 0 would write over records that are already there,
+// and the damage would only surface on the restart after this one.
+func TestDBReopenThenPutAppends(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("before"), []byte("written-first"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	err = reopened.Put([]byte("after"), []byte("written-second"))
+	if err != nil {
+		t.Fatalf("Put after reopen failed: %v", err)
+	}
+
+	// the new record must not have landed on top of the old one
+	got, err := reopened.Get([]byte("before"))
+	if err != nil {
+		t.Fatalf("Get of the earlier key failed: %v", err)
+	}
+
+	if !bytes.Equal(got, []byte("written-first")) {
+		t.Errorf("earlier key = %q, want %q", got, "written-first")
+	}
+
+	// and it has to survive a second trip through recovery
+	err = reopened.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	third, err := Open(dir)
+	if err != nil {
+		t.Fatalf("second reopen failed: %v", err)
+	}
+
+	if third.keyDirectory.Len() != 2 {
+		t.Errorf("keydir Len = %d, want 2", third.keyDirectory.Len())
+	}
+}
+
+// TestDBOpenEmptyDirectory checks a directory with no data files opens as a new
+// database rather than failing.
+func TestDBOpenEmptyDirectory(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open on an empty directory failed: %v", err)
+	}
+
+	if db.keyDirectory.Len() != 0 {
+		t.Errorf("keydir Len = %d, want 0", db.keyDirectory.Len())
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Errorf("Put on a new database failed: %v", err)
+	}
+}
