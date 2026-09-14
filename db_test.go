@@ -4,9 +4,38 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
+
+// rotationFixture fills a database with count records under the given size
+// threshold, and returns it alongside the key and value for index i.
+func rotationFixture(t *testing.T, dir string, threshold int64, count int) *DB {
+	t.Helper()
+
+	db, err := Open(dir, WithMaxFileSize(threshold))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	for i := 0; i < count; i++ {
+		err = db.Put(rotationKey(i), rotationValue(i))
+		if err != nil {
+			t.Fatalf("Put %d failed: %v", i, err)
+		}
+	}
+
+	return db
+}
+
+func rotationKey(i int) []byte {
+	return []byte(fmt.Sprintf("user:%d", i))
+}
+
+func rotationValue(i int) []byte {
+	return []byte(fmt.Sprintf("value-%d-padding-padding", i))
+}
 
 // TestDBPutGet stores a value and reads it back — the whole engine end to end,
 // through the keydir and out to the file.
@@ -810,5 +839,532 @@ func TestDBOpenEmptyDirectory(t *testing.T) {
 	err = db.Put([]byte("user:1"), []byte("alice"))
 	if err != nil {
 		t.Errorf("Put on a new database failed: %v", err)
+	}
+}
+
+// TestDBRotatesPastThreshold checks the active file is sealed before it grows past the limit.
+func TestDBRotatesPastThreshold(t *testing.T) {
+	dir := t.TempDir()
+
+	db := rotationFixture(t, dir, 1024, 200)
+	defer db.Close()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+
+	// five is the number session 2.6 asks for at a 1KB threshold
+	if len(entries) < 5 {
+		t.Fatalf("data files = %d, want at least 5", len(entries))
+	}
+
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			t.Fatalf("Info for %s failed: %v", e.Name(), err)
+		}
+
+		if info.Size() > 1024 {
+			t.Errorf("%s is %d bytes, past the 1024 threshold", e.Name(), info.Size())
+		}
+	}
+}
+
+// TestDBReadsAcrossFiles is the point of the session: a key written before a rotation still reads.
+func TestDBReadsAcrossFiles(t *testing.T) {
+	const count = 200
+
+	db := rotationFixture(t, t.TempDir(), 1024, count)
+
+	// backwards, so the oldest keys — the ones in sealed files — are read first
+	for i := count - 1; i >= 0; i-- {
+		got, err := db.Get(rotationKey(i))
+		if err != nil {
+			t.Fatalf("Get %q failed: %v", rotationKey(i), err)
+		}
+
+		if !bytes.Equal(got, rotationValue(i)) {
+			t.Errorf("Get %q = %q, want %q", rotationKey(i), got, rotationValue(i))
+		}
+	}
+}
+
+// TestDBEntriesSpanSeveralFiles checks the keydir records which file took each record.
+func TestDBEntriesSpanSeveralFiles(t *testing.T) {
+	const count = 200
+
+	db := rotationFixture(t, t.TempDir(), 1024, count)
+
+	seen := make(map[uint32]bool)
+
+	for i := 0; i < count; i++ {
+		entry, ok := db.keyDirectory.Get(rotationKey(i))
+		if !ok {
+			t.Fatalf("key %q missing from the keydir", rotationKey(i))
+		}
+
+		seen[entry.FileID] = true
+	}
+
+	if len(seen) < 2 {
+		t.Errorf("entries reference %d distinct file ids, want more than one", len(seen))
+	}
+}
+
+// TestDBOversizedRecordGetsItsOwnFile checks a record larger than the threshold is still stored.
+func TestDBOversizedRecordGetsItsOwnFile(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(100))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	key := []byte("big")
+	value := bytes.Repeat([]byte("x"), 500)
+
+	err = db.Put(key, value)
+	if err != nil {
+		t.Fatalf("Put of an oversized record failed: %v", err)
+	}
+
+	// a second write proves the first did not leave the database wedged
+	err = db.Put([]byte("small"), []byte("v"))
+	if err != nil {
+		t.Fatalf("Put after an oversized record failed: %v", err)
+	}
+
+	got, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("Get of the oversized record failed: %v", err)
+	}
+
+	if !bytes.Equal(got, value) {
+		t.Errorf("oversized value came back %d bytes, want %d", len(got), len(value))
+	}
+}
+
+// TestDBRotationKeepsSealedFilesOpen checks a sealed file is cached rather than closed.
+func TestDBRotationKeepsSealedFilesOpen(t *testing.T) {
+	db := rotationFixture(t, t.TempDir(), 1024, 200)
+
+	if len(db.readFiles) == 0 {
+		t.Fatalf("no sealed files cached after rotating")
+	}
+
+	activeID := db.dataFile.id
+
+	if _, ok := db.readFiles[activeID]; ok {
+		t.Errorf("the active file id %d is also in readFiles", activeID)
+	}
+}
+
+// TestDBReopenAcrossManyFiles checks recovery replays every file, not just the newest.
+func TestDBReopenAcrossManyFiles(t *testing.T) {
+	const count = 200
+
+	dir := t.TempDir()
+
+	db := rotationFixture(t, dir, 1024, count)
+
+	err := db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// without this the test would still pass if rotation had fired only once,
+	// and recovery across many files would go unproven
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+
+	if len(entries) < 5 {
+		t.Fatalf("data files = %d, want at least 5 to replay across", len(entries))
+	}
+
+	reopened, err := Open(dir, WithMaxFileSize(1024))
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	if reopened.keyDirectory.Len() != count {
+		t.Fatalf("keydir Len after reopen = %d, want %d", reopened.keyDirectory.Len(), count)
+	}
+
+	for i := 0; i < count; i++ {
+		got, err := reopened.Get(rotationKey(i))
+		if err != nil {
+			t.Fatalf("Get %q after reopen failed: %v", rotationKey(i), err)
+		}
+
+		if !bytes.Equal(got, rotationValue(i)) {
+			t.Errorf("Get %q = %q, want %q", rotationKey(i), got, rotationValue(i))
+		}
+	}
+}
+
+// TestDBCacheFillsLazilyAfterReopen checks a restart opens only the active file, then caches on demand.
+func TestDBCacheFillsLazilyAfterReopen(t *testing.T) {
+	const count = 200
+
+	dir := t.TempDir()
+
+	db := rotationFixture(t, dir, 1024, count)
+
+	err := db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir, WithMaxFileSize(1024))
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	if len(reopened.readFiles) != 0 {
+		t.Errorf("readFiles after reopen = %d, want 0", len(reopened.readFiles))
+	}
+
+	// key 0 lives in the very first file, so reading it must open exactly one
+	_, err = reopened.Get(rotationKey(0))
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if len(reopened.readFiles) != 1 {
+		t.Fatalf("readFiles after one sealed read = %d, want 1", len(reopened.readFiles))
+	}
+
+	// a second key from the same file reuses the handle rather than opening another
+	_, err = reopened.Get(rotationKey(1))
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if len(reopened.readFiles) != 1 {
+		t.Errorf("readFiles after a second read of the same file = %d, want 1", len(reopened.readFiles))
+	}
+}
+
+// TestDBCloseReleasesCachedFiles checks sealed handles are closed too, not just the active one.
+func TestDBCloseReleasesCachedFiles(t *testing.T) {
+	db := rotationFixture(t, t.TempDir(), 1024, 200)
+
+	cached := len(db.readFiles)
+	if cached == 0 {
+		t.Fatalf("no sealed files cached, so this test proves nothing")
+	}
+
+	err := db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if len(db.readFiles) != 0 {
+		t.Errorf("readFiles after Close = %d, want 0 (%d handles leaked)", len(db.readFiles), cached)
+	}
+}
+
+// TestDBDeleteRotates checks a tombstone is a write like any other and can seal a file.
+func TestDBDeleteRotates(t *testing.T) {
+	dir := t.TempDir()
+
+	// the put is 32 bytes and the tombstone 27, so 40 leaves room for one but
+	// not both
+	db, err := Open(dir, WithMaxFileSize(40))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	before := db.dataFile.id
+
+	err = db.Delete([]byte("user:1"))
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	if db.dataFile.id == before {
+		t.Errorf("active file id is still %d, want the tombstone to have rotated it", before)
+	}
+
+	_, err = db.Get([]byte("user:1"))
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("Get after Delete = %v, want ErrKeyNotFound", err)
+	}
+}
+
+// TestDBMaxFileSizeClampsBelowOne checks a threshold under 1 falls back to the default.
+func TestDBMaxFileSizeClampsBelowOne(t *testing.T) {
+	db, err := Open(t.TempDir(), WithMaxFileSize(0))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if db.maxFileSize != defaultMaxFileSize {
+		t.Errorf("maxFileSize = %d, want the default %d", db.maxFileSize, defaultMaxFileSize)
+	}
+}
+
+// TestDBRotatesOnlyPastTheThreshold checks the boundary: a record that fits exactly does not rotate.
+func TestDBRotatesOnlyPastTheThreshold(t *testing.T) {
+	dir := t.TempDir()
+
+	key := []byte("k")
+	value := []byte("v")
+	size := int64(RecordSize(len(key), len(value)))
+
+	// room for exactly two records, so the third is the first that cannot fit
+	db, err := Open(dir, WithMaxFileSize(2*size))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put(key, value)
+	if err != nil {
+		t.Fatalf("first Put failed: %v", err)
+	}
+
+	if db.dataFile.id != 0 {
+		t.Fatalf("rotated after one record, active id = %d", db.dataFile.id)
+	}
+
+	// same length as the first, so this fills the file to exactly the threshold
+	err = db.Put([]byte("l"), value)
+	if err != nil {
+		t.Fatalf("second Put failed: %v", err)
+	}
+
+	if db.dataFile.id != 0 {
+		t.Errorf("rotated at exactly the threshold, active id = %d, want 0", db.dataFile.id)
+	}
+
+	err = db.Put([]byte("m"), value)
+	if err != nil {
+		t.Fatalf("third Put failed: %v", err)
+	}
+
+	if db.dataFile.id != 1 {
+		t.Errorf("active id = %d, want 1 — the third record should not have fit", db.dataFile.id)
+	}
+}
+
+// TestDBThresholdBelowRecordSize checks every record getting its own file still terminates.
+func TestDBThresholdBelowRecordSize(t *testing.T) {
+	dir := t.TempDir()
+
+	const count = 5
+
+	// 1 byte cannot hold even a header, so no record ever fits
+	db, err := Open(dir, WithMaxFileSize(1))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	for i := 0; i < count; i++ {
+		err = db.Put(rotationKey(i), rotationValue(i))
+		if err != nil {
+			t.Fatalf("Put %d failed: %v", i, err)
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+
+	if len(entries) != count {
+		t.Errorf("data files = %d, want %d — one per record", len(entries), count)
+	}
+
+	for i := 0; i < count; i++ {
+		got, err := db.Get(rotationKey(i))
+		if err != nil {
+			t.Fatalf("Get %q failed: %v", rotationKey(i), err)
+		}
+
+		if !bytes.Equal(got, rotationValue(i)) {
+			t.Errorf("Get %q = %q, want %q", rotationKey(i), got, rotationValue(i))
+		}
+	}
+}
+
+// TestDBOverwriteAcrossFilesSurvivesReopen checks replay prefers the newer record in a later file.
+func TestDBOverwriteAcrossFilesSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	key := []byte("user:0")
+
+	db := rotationFixture(t, dir, 1024, 200)
+
+	// key:0 lives in the first file; this rewrite lands in the newest one
+	err := db.Put(key, []byte("rewritten-much-later"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	oldEntry, _ := db.keyDirectory.Get(key)
+	if oldEntry.FileID == 0 {
+		t.Fatalf("the rewrite landed in file 0, so this test proves nothing")
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir, WithMaxFileSize(1024))
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	got, err := reopened.Get(key)
+	if err != nil {
+		t.Fatalf("Get after reopen failed: %v", err)
+	}
+
+	if !bytes.Equal(got, []byte("rewritten-much-later")) {
+		t.Errorf("Get = %q, want the rewrite — an earlier file won", got)
+	}
+}
+
+// TestDBDeleteAcrossFilesSurvivesReopen checks a tombstone in a later file removes a key from an earlier one.
+func TestDBDeleteAcrossFilesSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	deleted := []byte("user:0")
+
+	db := rotationFixture(t, dir, 1024, 200)
+
+	err := db.Delete(deleted)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir, WithMaxFileSize(1024))
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	_, err = reopened.Get(deleted)
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("deleted key came back after reopen: err = %v, want ErrKeyNotFound", err)
+	}
+
+	// the neighbour in the same sealed file must be untouched
+	got, err := reopened.Get(rotationKey(1))
+	if err != nil {
+		t.Fatalf("Get of the neighbouring key failed: %v", err)
+	}
+
+	if !bytes.Equal(got, rotationValue(1)) {
+		t.Errorf("neighbour = %q, want %q", got, rotationValue(1))
+	}
+}
+
+// TestDBGetMissingDataFileErrors checks a dangling entry errors rather than creating an empty file.
+func TestDBGetMissingDataFileErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// an entry pointing at a file that was never written — the shape compaction
+	// will produce in week 3 when it deletes a file a reader still points at
+	db.keyDirectory.Put([]byte("ghost"), Entry{FileID: 99, Offset: 0, Size: 30, Timestamp: 1})
+
+	_, err = db.Get([]byte("ghost"))
+	if err == nil {
+		t.Fatalf("Get of a dangling entry returned nil, want an error")
+	}
+
+	if !os.IsNotExist(err) {
+		t.Errorf("err = %v, want a not-exist error", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+
+	// dontCreateIfMissing is what keeps this at one file rather than two
+	if len(entries) != 1 {
+		t.Errorf("data files = %d, want 1 — the failed read created one", len(entries))
+	}
+}
+
+// TestDBEmptyValueAcrossRotation checks a zero-length value is still not a tombstone after a reopen.
+func TestDBEmptyValueAcrossRotation(t *testing.T) {
+	dir := t.TempDir()
+	key := []byte("empty")
+
+	db := rotationFixture(t, dir, 1024, 200)
+
+	err := db.Put(key, []byte{})
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir, WithMaxFileSize(1024))
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	got, err := reopened.Get(key)
+	if err != nil {
+		t.Fatalf("Get of an empty value after reopen failed: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Errorf("len(value) = %d, want 0", len(got))
+	}
+}
+
+// TestDBReopenWithDifferentThreshold checks the threshold is a runtime setting, not stored on disk.
+func TestDBReopenWithDifferentThreshold(t *testing.T) {
+	const count = 200
+
+	dir := t.TempDir()
+
+	db := rotationFixture(t, dir, 1024, count)
+
+	err := db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// reopened with a threshold the existing files already exceed
+	reopened, err := Open(dir, WithMaxFileSize(64))
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	if reopened.keyDirectory.Len() != count {
+		t.Errorf("keydir Len = %d, want %d", reopened.keyDirectory.Len(), count)
+	}
+
+	got, err := reopened.Get(rotationKey(0))
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	if !bytes.Equal(got, rotationValue(0)) {
+		t.Errorf("Get = %q, want %q", got, rotationValue(0))
 	}
 }

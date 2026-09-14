@@ -16,6 +16,8 @@ const (
 	SyncEveryN
 )
 
+const defaultMaxFileSize = 2 << 30 // 2 GiB, a round number that is not too small
+
 // Option configures a DB at Open time. Each one is applied to the DB after it
 // is built, so the zero values in the struct are the defaults.
 type Option func(*DB)
@@ -48,16 +50,31 @@ func WithSyncEveryN(n int) Option {
 	}
 }
 
+// WithMaxFileSize seals the active file once it passes size bytes. A value below
+// 1 falls back to the default, since a threshold of zero would seal every record.
+func WithMaxFileSize(size int64) Option {
+
+	if size < 1 {
+		size = defaultMaxFileSize
+	}
+	return func(db *DB) {
+		db.maxFileSize = size
+	}
+}
+
 // DB is the public handle: a keydir in memory over one or more data files on
 // disk. Every write appends to the active file and updates the keydir.
 type DB struct {
-	directory    string     // where data files live; rotation (2.6) creates the next one here
-	dataFile     *DataFile  // the file every write is appended to
-	keyDirectory *KeyDir    // where each live key's newest record can be found
-	syncPolicy   SyncPolicy // when to flush; the zero value is SyncNever
-	syncEveryN   int        // the flush interval, only meaningful under SyncEveryN
-	writeCount   int        // writes since the last flush, only used under SyncEveryN
-	poisoned     error      // set once a sync fails, and never cleared
+	directory    string               // where data files live; rotation (2.6) creates the next one here
+	dataFile     *DataFile            // the file every write is appended to
+	keyDirectory *KeyDir              // where each live key's newest record can be found
+	syncPolicy   SyncPolicy           // when to flush; the zero value is SyncNever
+	syncEveryN   int                  // the flush interval, only meaningful under SyncEveryN
+	writeCount   int                  // writes since the last flush, only used under SyncEveryN
+	poisoned     error                // set once a sync fails, and never cleared
+	readFiles    map[uint32]*DataFile // open handles for reading old files, keyed by id
+	maxFileSize  int64                // the size past which the active file is sealed and the next one started
+
 }
 
 // Open prepares the database in dir for use. Called with no options it syncs
@@ -81,6 +98,8 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		directory:    dir,
 		dataFile:     dataf,
 		keyDirectory: keyd,
+		maxFileSize:  defaultMaxFileSize,
+		readFiles:    make(map[uint32]*DataFile),
 	}
 
 	// applied after the struct is built, so an option always overwrites a real
@@ -152,6 +171,12 @@ func (db *DB) Put(key, value []byte) error {
 		Value:     value,
 	}
 
+	err := db.rotateIfFull(RecordSize(len(key), len(value)))
+
+	if err != nil {
+		return err
+	}
+
 	// a failed append must not reach the keydir, or the entry points at a
 	// record that was never written
 	offset, err := db.dataFile.Append(r)
@@ -189,13 +214,51 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		return nil, ErrKeyNotFound
 	}
 
+	keysFileID := entry.FileID
+
+	df, err := db.fileFor(keysFileID)
+	if err != nil {
+		return nil, err
+	}
+
 	// the offset and size the keydir recorded when this record was written
-	r, err := db.dataFile.ReadAt(entry.Offset, entry.Size)
+	r, err := df.ReadAt(entry.Offset, entry.Size)
 	if err != nil {
 		return nil, err
 	}
 
 	return r.Value, nil
+}
+
+// fileFor resolves the file id in a keydir entry to an open file, opening and
+// caching sealed files the first time a read reaches for one.
+func (db *DB) fileFor(keysFileID uint32) (*DataFile, error) {
+
+	// the active file is held separately, since it is the only writable one
+	currentDataFileID := db.dataFile.id
+
+	if keysFileID == currentDataFileID {
+		return db.dataFile, nil
+	}
+
+	df, ok := db.readFiles[keysFileID]
+
+	if !ok {
+		// dontCreateIfMissing: the id came from the keydir, so the file exists.
+		// Creating an empty one would turn a missing file into a silent wrong
+		// answer rather than an error.
+		reopenedDF, reopenErr := OpenDataFile(db.directory, keysFileID, dontCreateIfMissing)
+		if reopenErr != nil {
+			return nil, reopenErr
+		}
+
+		// kept open, so later reads of the same file cost one syscall, not three
+		db.readFiles[keysFileID] = reopenedDF
+		df = reopenedDF
+	}
+
+	return df, nil
+
 }
 
 // Close flushes the data file whatever the policy says, then closes it. No
@@ -206,6 +269,17 @@ func (db *DB) Close() error {
 	// closed even when the flush failed, or the descriptor leaks on exactly the
 	// path where something has already gone wrong
 	closeErr := db.dataFile.Close()
+
+	// every sealed handle too, and all of them even if one fails, so a single
+	// bad handle cannot strand the rest
+	for id, df := range db.readFiles {
+		err := df.Close()
+		if err != nil && closeErr == nil {
+			closeErr = err
+		}
+
+		delete(db.readFiles, id)
+	}
 
 	// the sync error wins: it means data may be lost, where a close error
 	// usually means only that the handle was already gone
@@ -234,6 +308,12 @@ func (db *DB) Delete(key []byte) error {
 		Value: nil,
 	}
 
+	rotateErr := db.rotateIfFull(RecordSize(len(key), 0))
+
+	if rotateErr != nil {
+		return rotateErr
+	}
+
 	// keydir last: dropping the key before a failed append would leave it gone
 	// in memory but still live on disk, and the next restart would bring it back
 	_, err := db.dataFile.Append(tombstone)
@@ -245,4 +325,52 @@ func (db *DB) Delete(key []byte) error {
 
 	// syncing the df as per the policy
 	return db.syncAsPerPolicy()
+}
+
+// rotateIfFull seals the active file when the next record of size bytes would
+// take it past the threshold. Checked before the append, so the limit is
+// respected rather than overshot.
+func (db *DB) rotateIfFull(size int) error {
+
+	currDataFile := db.dataFile
+
+	// an empty file takes the record whatever its size: one larger than the
+	// threshold has nowhere else to go, and rotating first would only leave an
+	// empty file behind
+	if currDataFile.offset == 0 || currDataFile.offset+int64(size) <= db.maxFileSize {
+		return nil
+	}
+
+	return db.rotate()
+
+}
+
+// rotate seals the active file and starts the next one. The sealed file stays
+// open for reading, since keydir entries still point into it.
+func (db *DB) rotate() error {
+
+	currDataFile := db.dataFile
+
+	currID := currDataFile.id
+	newID := currID + 1
+
+	// flushed while db.dataFile still points at the file being sealed — one
+	// that will never be written again is a durability point
+	err := db.sync()
+	if err != nil {
+		return err
+	}
+
+	newDataFile, err := OpenDataFile(db.directory, newID, createIfMissing)
+
+	if err != nil {
+		return err
+	}
+
+	// both together, and only once the successor exists: a failed open leaves
+	// the active file exactly where it was
+	db.readFiles[currID] = currDataFile
+	db.dataFile = newDataFile
+	return nil
+
 }
