@@ -28,13 +28,61 @@ err = db.Close()
 - A configurable flush policy, measured below
 - Recovery on `Open` — the keydir is rebuilt from the log, so data survives a
   restart
+- File rotation — the active file is sealed past a size threshold and reads
+  resolve across every file
 
-Not yet: file rotation, compaction, and concurrent access.
+Not yet: compaction and concurrent access.
+
+## File rotation
+
+Writes go into one *active* file. Once it passes a size threshold the file is
+sealed and a new one started, so a database is a numbered sequence of files —
+`000000.data`, `000001.data`, and so on — of which only the last is written to.
+
+```go
+db, err := cooperdb.Open("./data", WithMaxFileSize(64<<20))   // 64 MiB
+```
+
+The default is 2 GiB, which is also Bitcask's. Sealed files are immutable, and
+that immutability is what compaction will need to work on — a single
+ever-growing file would leave it nothing safe to rewrite.
+
+**The threshold should be comfortably larger than your typical record.** A
+record cannot be split across files, so one that exceeds the threshold gets a
+file to itself. Set the threshold near or below your record size and you get
+roughly one file per record, which is a great many files and a great many open
+descriptors.
+
+Three decisions worth knowing about, because they are visible in how the
+database behaves:
+
+**The threshold is checked before a record is written, not after.** So a file
+never exceeds it, rather than overshooting by one record — except in the
+oversized case above, where there is no alternative.
+
+**Sealing flushes.** A file that will never be written again is flushed to disk
+as it is sealed, whatever the sync policy says. This bounds how much unflushed
+data can accumulate, and it is why the `SyncNever` row below says *since the
+last file seal* rather than something unbounded.
+
+**Sealed files are held open, and opened lazily.** A read resolves which file
+holds the record and keeps that handle for subsequent reads. A restart therefore
+opens exactly one file — the active one — and older files are opened only when a
+read actually reaches for them. Handles are opened read-only, so appending to a
+sealed file is refused by the kernel rather than merely discouraged.
+
+The cost is that nothing evicts them: a database with very many files will hold
+very many descriptors. A production version would bound that with an LRU cache;
+Basho's own guidance for Bitcask is to raise the open-file limit instead.
+
+The threshold is a runtime setting, not a property of the data. Reopening with a
+different value is fine — existing files keep whatever size they were written at.
 
 ## Recovery
 
 The keydir lives only in memory. `Open` reconstructs it by replaying every data
-file, which is what makes a write survive the process that made it.
+file in creation order, which is what makes a write survive the process that
+made it.
 
 Replay walks files in creation order and records in offset order, so the last
 record to touch a key is the one that wins. Filenames are zero-padded
@@ -87,7 +135,7 @@ db, err := cooperdb.Open("./data", WithSyncAlways())
 
 | policy | ops/sec | ns/op | a power loss can take |
 |---|---:|---:|---|
-| `SyncNever` | ~521,000 | 1,920 | every write the kernel has not written back yet |
+| `SyncNever` | ~521,000 | 1,920 | writes since the last file seal that the kernel has not written back yet |
 | `SyncEveryN(100)` | ~26,200 | 38,184 | at most the last 100 writes |
 | `SyncAlways` | ~261 | 3,831,932 | nothing that has returned |
 | `Get` (policy has no effect) | ~1,261,000 | 793 | — |
