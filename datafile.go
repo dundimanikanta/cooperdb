@@ -180,8 +180,15 @@ func (d *DataFile) ScanRecordAt(offset int64) (*Record, int, error) {
 	keySize := binary.LittleEndian.Uint32(header[12:16])
 	valueSize := binary.LittleEndian.Uint32(header[16:20])
 
-	// now the size is known, this read goes through the decoding path so the
-	// crc is verified
+	// These came off disk and are entirely unverified — the crc cannot be
+	// checked until they say where the record ends. A record cannot extend past
+	// the end of the file holding it, and a damaged tail read as a header gives
+	// arbitrary sizes: 3.12 GB from a 60-byte file, in one observed case.
+	if offset+int64(headerSize)+int64(keySize)+int64(valueSize) > d.offset {
+		return nil, 0, ErrShortRecord
+	}
+
+	// safe to narrow only because the check above proved these fit in the file
 	recordSize := RecordSize(int(keySize), int(valueSize))
 
 	record, err := d.ReadAt(offset, recordSize)
@@ -199,7 +206,7 @@ func (d *DataFile) ScanRecordAt(offset int64) (*Record, int, error) {
 // is still good.
 //
 // fn returning an error stops the scan and passes that error back.
-func (d *DataFile) Scan(fn func(offset int64, r *Record) error) error {
+func (d *DataFile) Scan(fn func(offset int64, r *Record) error) (int64, error) {
 	// records sit end to end from the start of the file, so the walk begins at 0
 	offset := int64(0)
 
@@ -207,24 +214,27 @@ func (d *DataFile) Scan(fn func(offset int64, r *Record) error) error {
 		record, size, err := d.ScanRecordAt(offset)
 
 		// a damaged or half-written tail is what a crash leaves behind, so it
-		// ends the scan rather than failing it — everything before it is good
+		// ends the scan rather than failing it — everything before it is good.
+		// offset is where the good data stops, which is what the caller needs:
+		// appending past it would hide every later record from the next scan,
+		// since records are found by chaining from the previous one.
 		if errors.Is(err, io.EOF) ||
 			errors.Is(err, io.ErrUnexpectedEOF) ||
 			errors.Is(err, ErrShortRecord) ||
 			errors.Is(err, ErrCorruptRecord) {
-			return nil
+			return offset, nil
 		}
 
 		// anything else is a real I/O failure, and recovery should not pretend
 		// it read a whole file when it did not
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		// the caller decides what the record means; its error stops the walk
 		err = fn(offset, record)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		// the record just read ends exactly where the next one begins

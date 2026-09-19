@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -1366,5 +1367,91 @@ func TestDBReopenWithDifferentThreshold(t *testing.T) {
 
 	if !bytes.Equal(got, rotationValue(0)) {
 		t.Errorf("Get = %q, want %q", got, rotationValue(0))
+	}
+}
+
+// TestDBTornTailDoesNotHideLaterWrites is the regression test for a two-restart
+// data-loss bug: a crash leaves a partial record, the next Open appends past it
+// instead of over it, and every record written after becomes invisible to the
+// recovery scan after that — because records are found by chaining from the
+// previous one, so one unreadable record breaks the chain permanently.
+func TestDBTornTailDoesNotHideLaterWrites(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("before"), []byte("written-first"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// a crash mid-write leaves a fragment too short to be a record. Appended
+	// directly, because killing the process would not produce one — the page
+	// cache survives a SIGKILL and a record is a single Write call.
+	path := filepath.Join(dir, "000000.data")
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, dataFilePerm)
+	if err != nil {
+		t.Fatalf("opening the file to damage it failed: %v", err)
+	}
+
+	_, err = f.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02})
+	if err != nil {
+		t.Fatalf("writing the fragment failed: %v", err)
+	}
+
+	err = f.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// dropped without Close, as a crash would leave it
+	err = db.dataFile.file.Close()
+	if err != nil {
+		t.Fatalf("closing the handle failed: %v", err)
+	}
+
+	// first restart: recovery stops at the fragment, which is correct
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("first reopen failed: %v", err)
+	}
+
+	_, err = reopened.Get([]byte("before"))
+	if err != nil {
+		t.Fatalf("the record written before the damage was lost: %v", err)
+	}
+
+	err = reopened.Put([]byte("after"), []byte("written-second"))
+	if err != nil {
+		t.Fatalf("Put after reopening failed: %v", err)
+	}
+
+	err = reopened.dataFile.file.Close()
+	if err != nil {
+		t.Fatalf("closing the handle failed: %v", err)
+	}
+
+	// second restart: this is where the bug showed. The record written after
+	// the damage must still be reachable.
+	third, err := Open(dir)
+	if err != nil {
+		t.Fatalf("second reopen failed: %v", err)
+	}
+
+	if third.keyDirectory.Len() != 2 {
+		t.Errorf("keydir Len = %d, want 2", third.keyDirectory.Len())
+	}
+
+	got, err := third.Get([]byte("after"))
+	if err != nil {
+		t.Fatalf("the record written after the damage was lost: %v", err)
+	}
+
+	if !bytes.Equal(got, []byte("written-second")) {
+		t.Errorf("Get = %q, want %q", got, "written-second")
 	}
 }

@@ -2,6 +2,9 @@ package cooperdb
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -82,13 +85,24 @@ type DB struct {
 func Open(dir string, opts ...Option) (*DB, error) {
 	// replay whatever is already on disk; an empty directory gives back an
 	// empty keydir and id 0, which is a new database rather than an error
-	keyd, activeID, err := loadKeyDir(dir)
+	keyd, activeID, activeValidLen, err := loadKeyDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	// a crash can leave a partial record at the tail. The scan above stopped
+	// before it, so the file is longer than its valid data — and OpenDataFile
+	// seeds the write offset from the file's SIZE, which would put the next
+	// record after the damage rather than over it. Everything written after
+	// would then be invisible to the next scan, because records are found by
+	// chaining from the previous one.
+	err = truncateToValid(dir, activeID, activeValidLen)
 	if err != nil {
 		return nil, err
 	}
 
 	// appends continue into the newest file, and OpenDataFile seeds its write
-	// offset from the file's size so they land after the records already there
+	// offset from the file's size — now equal to the valid length
 	dataf, err := OpenDataFile(dir, activeID, createIfMissing)
 	if err != nil {
 		return nil, err
@@ -109,6 +123,31 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// truncateToValid cuts a data file back to the length recovery could actually
+// read, discarding a partial record left by a crash. The bytes removed are by
+// definition unparseable — Decode already refused them.
+func truncateToValid(dir string, id uint32, validLen int64) error {
+	path := filepath.Join(dir, fmt.Sprintf("%06d.data", id))
+
+	fi, err := os.Stat(path)
+
+	// a new database: there is no file to trim
+	if os.IsNotExist(err) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// the normal case, where nothing was torn
+	if fi.Size() <= validLen {
+		return nil
+	}
+
+	return os.Truncate(path, validLen)
 }
 
 // syncAsPerPolicy flushes the data file if the configured policy calls for it.

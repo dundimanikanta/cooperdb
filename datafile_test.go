@@ -3,8 +3,10 @@ package cooperdb
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -290,5 +292,190 @@ func TestReadAtPastEOF(t *testing.T) {
 	// either EOF flavour is correct here; a nil error is not
 	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Errorf("err = %v, want io.EOF or io.ErrUnexpectedEOF", err)
+	}
+}
+
+// TestAppendOffsetAlwaysMatchesFileSize is the invariant the partial-write
+// cleanup exists to hold. O_APPEND sends every write to the physical end of
+// file, so the moment the tracked offset falls behind the real size, every
+// offset Append reports afterwards is wrong.
+func TestAppendOffsetAlwaysMatchesFileSize(t *testing.T) {
+	dir := t.TempDir()
+
+	file, err := OpenDataFile(dir, 0, createIfMissing)
+	if err != nil {
+		t.Fatalf("OpenDataFile failed: %v", err)
+	}
+
+	path := filepath.Join(dir, "000000.data")
+
+	for i := 0; i < 5; i++ {
+		r := &Record{
+			Timestamp: time.Now().UnixNano(),
+			Key:       []byte(fmt.Sprintf("user:%d", i)),
+			Value:     []byte("alice"),
+		}
+
+		_, err = file.Append(r)
+		if err != nil {
+			t.Fatalf("Append %d failed: %v", i, err)
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat failed: %v", err)
+		}
+
+		if file.offset != info.Size() {
+			t.Fatalf("after %d appends: offset = %d, file size = %d", i+1, file.offset, info.Size())
+		}
+	}
+}
+
+// TestAppendLeavesNothingBehindOnFailure checks a failed write does not grow the
+// file. Without the cleanup, bytes that landed before the failure stay — and
+// since O_APPEND writes at the real end of file, every later record would be
+// reported at an offset earlier than where it actually sits.
+func TestAppendLeavesNothingBehindOnFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	file, err := OpenDataFile(dir, 0, createIfMissing)
+	if err != nil {
+		t.Fatalf("OpenDataFile failed: %v", err)
+	}
+
+	path := filepath.Join(dir, "000000.data")
+
+	_, err = file.Append(&Record{
+		Timestamp: time.Now().UnixNano(),
+		Key:       []byte("user:1"),
+		Value:     []byte("alice"),
+	})
+	if err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+
+	// closing the handle underneath is the cheapest way to make a write fail
+	err = file.file.Close()
+	if err != nil {
+		t.Fatalf("closing the handle failed: %v", err)
+	}
+
+	_, err = file.Append(&Record{
+		Timestamp: time.Now().UnixNano(),
+		Key:       []byte("user:2"),
+		Value:     []byte("bob"),
+	})
+	if err == nil {
+		t.Fatalf("Append on a closed file returned nil, want an error")
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+
+	if after.Size() != before.Size() {
+		t.Errorf("file grew from %d to %d bytes on a failed write", before.Size(), after.Size())
+	}
+}
+
+// TestAppendRefusesAfterFailedCleanup checks that when the cleanup itself fails
+// the file is marked unusable. Its real length is then unknown, so continuing
+// would mean handing out offsets that are guesses.
+func TestAppendRefusesAfterFailedCleanup(t *testing.T) {
+	file, err := OpenDataFile(t.TempDir(), 0, createIfMissing)
+	if err != nil {
+		t.Fatalf("OpenDataFile failed: %v", err)
+	}
+
+	// a closed handle fails the write and the truncate that follows it
+	err = file.file.Close()
+	if err != nil {
+		t.Fatalf("closing the handle failed: %v", err)
+	}
+
+	_, err = file.Append(&Record{
+		Timestamp: time.Now().UnixNano(),
+		Key:       []byte("user:1"),
+		Value:     []byte("alice"),
+	})
+	if err == nil {
+		t.Fatalf("Append on a closed file returned nil, want an error")
+	}
+
+	if !file.damaged {
+		t.Fatalf("damaged flag not set after the cleanup failed")
+	}
+
+	// every later append is refused with a distinct error rather than attempted
+	_, err = file.Append(&Record{
+		Timestamp: time.Now().UnixNano(),
+		Key:       []byte("user:2"),
+		Value:     []byte("bob"),
+	})
+	if !errors.Is(err, ErrDataFileDamaged) {
+		t.Errorf("err = %v, want ErrDataFileDamaged", err)
+	}
+}
+
+// TestAppendRealDiskFull is the path the cleanup actually exists for: a genuine
+// short write from a full disk, where the truncate succeeds. It needs a
+// filesystem that can be filled, so it is skipped unless COOPERDB_FULL_DIR
+// points at one. To run it on macOS:
+//
+//	hdiutil create -size 2m -fs HFS+ -volname tinyvol /tmp/tiny.dmg
+//	hdiutil attach /tmp/tiny.dmg -nobrowse
+//	mkdir /Volumes/tinyvol/db
+//	COOPERDB_FULL_DIR=/Volumes/tinyvol/db go test -run TestAppendRealDiskFull ./...
+//	hdiutil detach /Volumes/tinyvol
+func TestAppendRealDiskFull(t *testing.T) {
+	dir := os.Getenv("COOPERDB_FULL_DIR")
+	if dir == "" {
+		t.Skip("set COOPERDB_FULL_DIR to a small, fillable filesystem to run this")
+	}
+
+	file, err := OpenDataFile(dir, 0, createIfMissing)
+	if err != nil {
+		t.Fatalf("OpenDataFile failed: %v", err)
+	}
+
+	path := filepath.Join(dir, "000000.data")
+	value := bytes.Repeat([]byte("x"), 4096)
+
+	var appendErr error
+
+	for i := 0; i < 1000000; i++ {
+		_, appendErr = file.Append(&Record{
+			Timestamp: time.Now().UnixNano(),
+			Key:       []byte("k"),
+			Value:     value,
+		})
+		if appendErr != nil {
+			break
+		}
+	}
+
+	if appendErr == nil {
+		t.Skip("the filesystem never filled; use a smaller one")
+	}
+
+	if file.damaged {
+		t.Errorf("damaged = true, want false — the truncate should have succeeded")
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+
+	if file.offset != info.Size() {
+		t.Errorf("offset = %d, file size = %d — the partial record was not removed",
+			file.offset, info.Size())
 	}
 }

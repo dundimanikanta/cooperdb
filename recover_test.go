@@ -279,7 +279,7 @@ func TestLoadKeyDirAcrossFiles(t *testing.T) {
 		t.Fatalf("Close 1 failed: %v", err)
 	}
 
-	kd, highestID, err := loadKeyDir(dir)
+	kd, highestID, _, err := loadKeyDir(dir)
 	if err != nil {
 		t.Fatalf("loadKeyDir failed: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestLoadKeyDirAcrossFiles(t *testing.T) {
 
 // TestLoadKeyDirEmptyDir checks that recovery over nothing is a new database.
 func TestLoadKeyDirEmptyDir(t *testing.T) {
-	kd, highestID, err := loadKeyDir(t.TempDir())
+	kd, highestID, _, err := loadKeyDir(t.TempDir())
 	if err != nil {
 		t.Fatalf("loadKeyDir failed: %v", err)
 	}
@@ -366,7 +366,7 @@ func TestLoadKeyDirStopsAtTornTail(t *testing.T) {
 		t.Fatalf("Truncate failed: %v", err)
 	}
 
-	kd, _, err := loadKeyDir(dir)
+	kd, _, _, err := loadKeyDir(dir)
 	if err != nil {
 		t.Fatalf("loadKeyDir on a torn tail failed: %v", err)
 	}
