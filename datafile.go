@@ -27,10 +27,16 @@ const (
 // The write offset is tracked here rather than read from the file handle
 // because O_APPEND makes the kernel jump to end-of-file on every write, so the
 // handle's own position says nothing useful about where the next record lands.
+// ErrDataFileDamaged is returned once a failed write leaves bytes behind that
+// could not be removed. The file's true length is then unknown, so any offset
+// this DataFile reported afterwards would be wrong.
+var ErrDataFileDamaged = errors.New("cooperdb: data file length unknown after a failed write")
+
 type DataFile struct {
-	file   *os.File
-	id     uint32
-	offset int64
+	file    *os.File
+	id      uint32
+	offset  int64
+	damaged bool // a failed write could not be cleaned up; offset is unreliable
 }
 
 // OpenDataFile opens the data file with the given id inside dir, positioning the
@@ -75,6 +81,11 @@ func OpenDataFile(dir string, id uint32, create bool) (*DataFile, error) {
 // Append encodes r, writes it to the end of the file, and returns the offset
 // the record starts at. That offset is what the keydir stores.
 func (d *DataFile) Append(r *Record) (int64, error) {
+	// once the length is unknown, every offset returned from here is a guess
+	if d.damaged {
+		return 0, ErrDataFileDamaged
+	}
+
 	// lay the record out as header | key | value
 	encoded := r.Encode()
 
@@ -86,8 +97,19 @@ func (d *DataFile) Append(r *Record) (int64, error) {
 	file := d.file
 	n, err := file.Write(encoded)
 
-	// a failed write must not advance the offset; partial writes are 2.4/2.5 work
 	if err != nil {
+		// bytes can land even on a failed write, and O_APPEND sends the *next*
+		// write to the physical end of file — so leaving them would make
+		// d.offset lie about where every later record goes. Cutting back to
+		// where this record began restores the state before the write.
+		//
+		// Safe to discard: Append is returning an error, so no caller was ever
+		// told this record exists.
+		if truncErr := file.Truncate(currentOffset); truncErr != nil {
+			d.damaged = true
+			return 0, truncErr
+		}
+
 		return 0, err
 	}
 
