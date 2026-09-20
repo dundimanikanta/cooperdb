@@ -1610,24 +1610,65 @@ func TestTombstoneAppliedAfterItsPut(t *testing.T) {
 
 	applyRecord(kd, 0, 0, &Record{Timestamp: 100, Key: []byte("user:1"), Value: []byte("alice")})
 	applyRecord(kd, 1, 0, &Record{Timestamp: 200, Flags: flagTombstone, Key: []byte("user:1")})
+	kd.dropTombstones()
 
 	if _, ok := kd.Get([]byte("user:1")); ok {
 		t.Errorf("key survived a newer tombstone")
 	}
 }
 
-// TestTombstoneOrderingIsNotSymmetric documents a known limit: Delete removes the
-// entry outright, so a tombstone leaves no timestamp and an older put replayed
-// after it wins. Replay must therefore still deliver records oldest-first, which
-// constrains what file id merge output can take.
-func TestTombstoneOrderingIsNotSymmetric(t *testing.T) {
+// TestTombstoneOrderingIsSymmetric is the reverse of TestTombstoneAppliedAfterItsPut:
+// a tombstone replayed before the put it deletes must still win, since merge can
+// leave an old record in a file numbered above the tombstone's.
+func TestTombstoneOrderingIsSymmetric(t *testing.T) {
 	kd := NewKeyDir()
 
-	// the reverse of TestTombstoneAppliedAfterItsPut: newer tombstone first
 	applyRecord(kd, 1, 0, &Record{Timestamp: 200, Flags: flagTombstone, Key: []byte("user:1")})
 	applyRecord(kd, 0, 0, &Record{Timestamp: 100, Key: []byte("user:1"), Value: []byte("alice")})
+	kd.dropTombstones()
 
-	if _, ok := kd.Get([]byte("user:1")); !ok {
-		t.Skip("tombstones now carry a timestamp — update this test and the merge design")
+	if _, ok := kd.Get([]byte("user:1")); ok {
+		t.Errorf("deleted key resurrected by an older put replayed after it")
+	}
+}
+
+// TestDeletedKeyAfterReopenIsNotFound checks a swept tombstone reads as a clean
+// miss rather than as a decode failure from a zero-valued entry.
+func TestDeletedKeyAfterReopenIsNotFound(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	err = db.Delete([]byte("user:1"))
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	db2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer db2.Close()
+
+	_, err = db2.Get([]byte("user:1"))
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("Get after reopen = %v, want ErrKeyNotFound", err)
+	}
+
+	if db2.keyDirectory.Len() != 0 {
+		t.Errorf("keydir Len = %d, want 0", db2.keyDirectory.Len())
 	}
 }

@@ -92,6 +92,10 @@ func loadKeyDir(dir string) (*KeyDir, uint32, int64, int64, error) {
 		activeValidLen = validLen
 	}
 
+	// the tombstone entries have done their work; what is handed back holds live
+	// keys only, which is what Get, Len and merge all assume
+	kd.dropTombstones()
+
 	return kd, highestID, activeValidLen, maxTimestamp, nil
 }
 
@@ -113,7 +117,11 @@ func applyRecord(kd *KeyDir, fileID uint32, offset int64, r *Record) {
 	// by the flag, never by an empty value: Put(key, nil) stores an empty value
 	// and must not be mistaken for a delete
 	if r.IsTombstone() {
-		kd.Delete(r.Key)
+		// stored rather than dropped, so the deletion's timestamp survives to be
+		// compared against. Removing the entry would leave nothing for the guard
+		// above to fire on, and merge rewrites old records into newly created
+		// files — so a put older than this tombstone can still arrive after it.
+		kd.Put(r.Key, Entry{Timestamp: r.Timestamp, Tombstone: true})
 		return
 	}
 

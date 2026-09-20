@@ -1,12 +1,14 @@
 package cooperdb
 
 // Entry locates the newest record for one key: Offset is where that record
-// starts, and Size covers the whole record, header included.
+// starts, and Size covers the whole record, header included. Tombstone marks a
+// replay-only entry with no location; loadKeyDir sweeps them before returning.
 type Entry struct {
 	FileID    uint32
 	Offset    int64
 	Size      int
 	Timestamp int64
+	Tombstone bool
 }
 
 // KeyDir maps every live key to the location of its newest record; the map is
@@ -35,6 +37,17 @@ func (k *KeyDir) Put(key []byte, e Entry) {
 // Delete drops key from the keydir; deleting an absent key is a no-op.
 func (k *KeyDir) Delete(key []byte) {
 	delete(k.entries, string(key))
+}
+
+// dropTombstones removes the replay-only tombstone entries, leaving a keydir of
+// live keys. Deleting during a range is defined in Go, and these are the entries
+// being removed anyway.
+func (k *KeyDir) dropTombstones() {
+	for key, entry := range k.entries {
+		if entry.Tombstone {
+			delete(k.entries, key)
+		}
+	}
 }
 
 // Len reports how many live keys the keydir is holding.

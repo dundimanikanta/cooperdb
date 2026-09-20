@@ -181,14 +181,15 @@ func TestApplyRecordEqualTimestampLaterWins(t *testing.T) {
 	}
 }
 
-// TestApplyRecordTombstoneRemoves checks that a replayed tombstone takes the key
-// back out rather than storing an entry for it.
+// TestApplyRecordTombstoneRemoves checks that a replayed tombstone leaves the key
+// gone once the replay-only entries are swept.
 func TestApplyRecordTombstoneRemoves(t *testing.T) {
 	kd := NewKeyDir()
 	key := []byte("user:1")
 
 	applyRecord(kd, 0, 0, &Record{Timestamp: 100, Key: key, Value: []byte("alice")})
 	applyRecord(kd, 0, 32, &Record{Timestamp: 200, Flags: flagTombstone, Key: key})
+	kd.dropTombstones()
 
 	_, ok := kd.Get(key)
 	if ok {
@@ -380,5 +381,50 @@ func TestLoadKeyDirStopsAtTornTail(t *testing.T) {
 	_, ok := kd.Get([]byte("user:1"))
 	if !ok {
 		t.Errorf("the record before the torn one was lost")
+	}
+}
+
+// TestLoadKeyDirOlderPutInLaterFileLoses is the merge case: a relocated old record
+// lands in a higher-numbered file than the tombstone that deletes it.
+func TestLoadKeyDirOlderPutInLaterFileLoses(t *testing.T) {
+	dir := t.TempDir()
+
+	df0, err := OpenDataFile(dir, 0, createIfMissing)
+	if err != nil {
+		t.Fatalf("OpenDataFile 0 failed: %v", err)
+	}
+
+	_, err = df0.Append(&Record{Timestamp: 300, Flags: flagTombstone, Key: []byte("user:1")})
+	if err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	err = df0.Close()
+	if err != nil {
+		t.Fatalf("Close 0 failed: %v", err)
+	}
+
+	df1, err := OpenDataFile(dir, 1, createIfMissing)
+	if err != nil {
+		t.Fatalf("OpenDataFile 1 failed: %v", err)
+	}
+
+	_, err = df1.Append(&Record{Timestamp: 200, Key: []byte("user:1"), Value: []byte("alice")})
+	if err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	err = df1.Close()
+	if err != nil {
+		t.Fatalf("Close 1 failed: %v", err)
+	}
+
+	kd, _, _, _, err := loadKeyDir(dir)
+	if err != nil {
+		t.Fatalf("loadKeyDir failed: %v", err)
+	}
+
+	if _, ok := kd.Get([]byte("user:1")); ok {
+		t.Errorf("deleted key resurrected by an older put in a later file")
 	}
 }
