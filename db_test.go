@@ -1672,3 +1672,51 @@ func TestDeletedKeyAfterReopenIsNotFound(t *testing.T) {
 		t.Errorf("keydir Len = %d, want 0", db2.keyDirectory.Len())
 	}
 }
+
+// TestNextFileIDNeverRepeats checks the allocator hands out a fresh id every time.
+func TestNextFileIDNeverRepeats(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	seen := map[uint32]bool{db.dataFile.id: true}
+
+	for i := 0; i < 10; i++ {
+		id := db.nextFileID()
+		if seen[id] {
+			t.Fatalf("nextFileID handed out %d twice", id)
+		}
+		seen[id] = true
+	}
+}
+
+// TestRotateSkipsAnAllocatedID checks rotation takes its id from the shared
+// allocator, so a file merge has already reserved is not opened a second time.
+func TestRotateSkipsAnAllocatedID(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(64))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	err = db.Put(rotationKey(0), rotationValue(0))
+	if err != nil {
+		t.Fatalf("first Put failed: %v", err)
+	}
+
+	// as Merge will: reserve an id without opening the file yet
+	claimed := db.nextFileID()
+
+	err = db.Put(rotationKey(1), rotationValue(1))
+	if err != nil {
+		t.Fatalf("second Put failed: %v", err)
+	}
+
+	if db.dataFile.id == claimed {
+		t.Errorf("rotation opened file %d, already reserved by another caller", claimed)
+	}
+}

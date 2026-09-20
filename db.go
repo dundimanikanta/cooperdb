@@ -78,6 +78,7 @@ type DB struct {
 	readFiles     map[uint32]*DataFile // open handles for reading old files, keyed by id
 	maxFileSize   int64                // the size past which the active file is sealed and the next one started
 	lastTimestamp int64                // the timestamp of the last written record
+	lastFileID    uint32               // the id of the most recently allocated data file
 }
 
 // Open prepares the database in dir for use. Called with no options it syncs
@@ -115,6 +116,7 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		maxFileSize:   defaultMaxFileSize,
 		readFiles:     make(map[uint32]*DataFile),
 		lastTimestamp: previousMaxTimestamp,
+		lastFileID:    activeID,
 	}
 
 	// applied after the struct is built, so an option always overwrites a real
@@ -205,6 +207,13 @@ func (db *DB) nextTimestamp() int64 {
 	}
 	db.lastTimestamp = ts
 	return ts
+}
+
+// nextFileID reserves a file id nothing has used yet. Rotation and merge both
+// allocate, so each computing its own successor would land them on one file.
+func (db *DB) nextFileID() uint32 {
+	db.lastFileID++
+	return db.lastFileID
 }
 
 // Put stores value under key, appending a new record and repointing the keydir.
@@ -401,7 +410,6 @@ func (db *DB) rotate() error {
 	currDataFile := db.dataFile
 
 	currID := currDataFile.id
-	newID := currID + 1
 
 	// flushed while db.dataFile still points at the file being sealed — one
 	// that will never be written again is a durability point
@@ -410,7 +418,8 @@ func (db *DB) rotate() error {
 		return err
 	}
 
-	newDataFile, err := OpenDataFile(db.directory, newID, createIfMissing)
+	// from the shared allocator, not currID + 1: merge reserves ids too
+	newDataFile, err := OpenDataFile(db.directory, db.nextFileID(), createIfMissing)
 
 	if err != nil {
 		return err
