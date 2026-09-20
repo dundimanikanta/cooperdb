@@ -46,16 +46,17 @@ func dataFileIDs(dir string) ([]uint32, error) {
 // reconstructs, the highest file id seen so the caller knows which file to
 // reopen as active, and that file's valid-data length — which is NOT its size
 // when a crash left a partial record at the tail.
-func loadKeyDir(dir string) (*KeyDir, uint32, int64, error) {
+func loadKeyDir(dir string) (*KeyDir, uint32, int64, int64, error) {
 	// an empty directory is a new database, not a failure, so these are what a
 	// caller gets when the loop below never runs
 	kd := NewKeyDir()
 	highestID := uint32(0)
 	activeValidLen := int64(0)
+	maxTimestamp := int64(0)
 
 	ids, err := dataFileIDs(dir)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, 0, 0, err
 	}
 
 	// creation order, because a later file's records must land last
@@ -64,13 +65,16 @@ func loadKeyDir(dir string) (*KeyDir, uint32, int64, error) {
 		// one is a real problem rather than something to create and scan empty
 		df, err := OpenDataFile(dir, id, dontCreateIfMissing)
 		if err != nil {
-			return nil, 0, 0, err
+			return nil, 0, 0, 0, err
 		}
 
 		// id is captured from this iteration, so every record gets the file it
 		// was actually read from
 		validLen, err := df.Scan(func(offset int64, r *Record) error {
 			applyRecord(kd, id, offset, r)
+			if r.Timestamp > maxTimestamp {
+				maxTimestamp = r.Timestamp
+			}
 			return nil
 		})
 
@@ -79,7 +83,7 @@ func loadKeyDir(dir string) (*KeyDir, uint32, int64, error) {
 		df.Close()
 
 		if err != nil {
-			return nil, 0, 0, err
+			return nil, 0, 0, 0, err
 		}
 
 		// ids arrive sorted, so the last one seen is the highest — and the last
@@ -88,7 +92,7 @@ func loadKeyDir(dir string) (*KeyDir, uint32, int64, error) {
 		activeValidLen = validLen
 	}
 
-	return kd, highestID, activeValidLen, nil
+	return kd, highestID, activeValidLen, maxTimestamp, nil
 }
 
 // applyRecord folds one replayed record into the keydir.

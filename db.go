@@ -68,16 +68,16 @@ func WithMaxFileSize(size int64) Option {
 // DB is the public handle: a keydir in memory over one or more data files on
 // disk. Every write appends to the active file and updates the keydir.
 type DB struct {
-	directory    string               // where data files live; rotation (2.6) creates the next one here
-	dataFile     *DataFile            // the file every write is appended to
-	keyDirectory *KeyDir              // where each live key's newest record can be found
-	syncPolicy   SyncPolicy           // when to flush; the zero value is SyncNever
-	syncEveryN   int                  // the flush interval, only meaningful under SyncEveryN
-	writeCount   int                  // writes since the last flush, only used under SyncEveryN
-	poisoned     error                // set once a sync fails, and never cleared
-	readFiles    map[uint32]*DataFile // open handles for reading old files, keyed by id
-	maxFileSize  int64                // the size past which the active file is sealed and the next one started
-
+	directory     string               // where data files live; rotation (2.6) creates the next one here
+	dataFile      *DataFile            // the file every write is appended to
+	keyDirectory  *KeyDir              // where each live key's newest record can be found
+	syncPolicy    SyncPolicy           // when to flush; the zero value is SyncNever
+	syncEveryN    int                  // the flush interval, only meaningful under SyncEveryN
+	writeCount    int                  // writes since the last flush, only used under SyncEveryN
+	poisoned      error                // set once a sync fails, and never cleared
+	readFiles     map[uint32]*DataFile // open handles for reading old files, keyed by id
+	maxFileSize   int64                // the size past which the active file is sealed and the next one started
+	lastTimestamp int64                // the timestamp of the last written record
 }
 
 // Open prepares the database in dir for use. Called with no options it syncs
@@ -85,7 +85,7 @@ type DB struct {
 func Open(dir string, opts ...Option) (*DB, error) {
 	// replay whatever is already on disk; an empty directory gives back an
 	// empty keydir and id 0, which is a new database rather than an error
-	keyd, activeID, activeValidLen, err := loadKeyDir(dir)
+	keyd, activeID, activeValidLen, previousMaxTimestamp, err := loadKeyDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -109,11 +109,12 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	}
 
 	db := &DB{
-		directory:    dir,
-		dataFile:     dataf,
-		keyDirectory: keyd,
-		maxFileSize:  defaultMaxFileSize,
-		readFiles:    make(map[uint32]*DataFile),
+		directory:     dir,
+		dataFile:      dataf,
+		keyDirectory:  keyd,
+		maxFileSize:   defaultMaxFileSize,
+		readFiles:     make(map[uint32]*DataFile),
+		lastTimestamp: previousMaxTimestamp,
 	}
 
 	// applied after the struct is built, so an option always overwrites a real
@@ -197,6 +198,15 @@ func (db *DB) sync() error {
 	return nil
 }
 
+func (db *DB) nextTimestamp() int64 {
+	ts := time.Now().UnixNano()
+	if ts <= db.lastTimestamp {
+		ts = db.lastTimestamp + 1
+	}
+	db.lastTimestamp = ts
+	return ts
+}
+
 // Put stores value under key, appending a new record and repointing the keydir.
 func (db *DB) Put(key, value []byte) error {
 	// a sync has failed, so what is actually on disk is unknown
@@ -205,7 +215,7 @@ func (db *DB) Put(key, value []byte) error {
 	}
 
 	r := &Record{
-		Timestamp: time.Now().UnixNano(),
+		Timestamp: db.nextTimestamp(),
 		Key:       key,
 		Value:     value,
 	}
@@ -338,7 +348,7 @@ func (db *DB) Delete(key []byte) error {
 	}
 
 	tombstone := &Record{
-		Timestamp: time.Now().UnixNano(),
+		Timestamp: db.nextTimestamp(),
 		// bit 0 set — this is what marks the deletion, not the empty value,
 		// since Put(key, []byte{}) writes an empty value too
 		Flags: flagTombstone,

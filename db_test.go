@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // rotationFixture fills a database with count records under the given size
@@ -1453,5 +1454,180 @@ func TestDBTornTailDoesNotHideLaterWrites(t *testing.T) {
 
 	if !bytes.Equal(got, []byte("written-second")) {
 		t.Errorf("Get = %q, want %q", got, "written-second")
+	}
+}
+
+// TestDBTimestampsNeverRepeat checks no two writes share a timestamp.
+func TestDBTimestampsNeverRepeat(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	const count = 20000
+
+	seen := make(map[int64]bool, count)
+
+	for i := 0; i < count; i++ {
+		err = db.Put([]byte(fmt.Sprintf("user:%d", i)), []byte("alice"))
+		if err != nil {
+			t.Fatalf("Put %d failed: %v", i, err)
+		}
+
+		if seen[db.lastTimestamp] {
+			t.Fatalf("timestamp %d repeated at write %d", db.lastTimestamp, i)
+		}
+
+		seen[db.lastTimestamp] = true
+	}
+}
+
+// TestDBTimestampResumesAfterRestart checks the counter is rebuilt from the log.
+func TestDBTimestampResumesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	stored := db.lastTimestamp
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	if reopened.lastTimestamp != stored {
+		t.Errorf("lastTimestamp after reopen = %d, want %d", reopened.lastTimestamp, stored)
+	}
+}
+
+// TestDBTimestampAheadOfClockSurvivesRestart is why seeding exists: a burst can
+// push the counter past the real clock, and a reset would then reuse a stored value.
+func TestDBTimestampAheadOfClockSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// what a heavy burst does, without writing a million records
+	db.lastTimestamp += int64(time.Second)
+
+	err = db.Put([]byte("user:2"), []byte("bob"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	ahead := db.lastTimestamp
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopening failed: %v", err)
+	}
+
+	err = reopened.Put([]byte("user:3"), []byte("carol"))
+	if err != nil {
+		t.Fatalf("Put after reopening failed: %v", err)
+	}
+
+	if reopened.lastTimestamp <= ahead {
+		t.Errorf("post-restart timestamp = %d, want greater than the stored %d",
+			reopened.lastTimestamp, ahead)
+	}
+}
+
+// TestReplayOrderDoesNotChangeResult checks that unique timestamps make replay
+// order irrelevant for puts — the property merge depends on.
+func TestReplayOrderDoesNotChangeResult(t *testing.T) {
+	records := []struct {
+		fileID uint32
+		offset int64
+		r      *Record
+	}{
+		{0, 0, &Record{Timestamp: 100, Key: []byte("user:1"), Value: []byte("v1")}},
+		{1, 0, &Record{Timestamp: 200, Key: []byte("user:2"), Value: []byte("other")}},
+		{1, 30, &Record{Timestamp: 300, Key: []byte("user:1"), Value: []byte("v2")}},
+		{3, 0, &Record{Timestamp: 400, Key: []byte("user:1"), Value: []byte("v3")}},
+	}
+
+	orders := [][]int{
+		{0, 1, 2, 3},
+		{3, 2, 1, 0},
+		{2, 0, 3, 1},
+		{3, 0, 2, 1},
+	}
+
+	for _, order := range orders {
+		kd := NewKeyDir()
+
+		for _, i := range order {
+			applyRecord(kd, records[i].fileID, records[i].offset, records[i].r)
+		}
+
+		got, ok := kd.Get([]byte("user:1"))
+		if !ok {
+			t.Fatalf("order %v: user:1 missing", order)
+		}
+
+		if got.Timestamp != 400 || got.FileID != 3 {
+			t.Errorf("order %v: entry = {FileID %d, Timestamp %d}, want {3, 400}",
+				order, got.FileID, got.Timestamp)
+		}
+
+		if kd.Len() != 2 {
+			t.Errorf("order %v: keydir Len = %d, want 2", order, kd.Len())
+		}
+	}
+}
+
+// TestTombstoneAppliedAfterItsPut checks the normal case: a delete replayed
+// after the record it deletes.
+func TestTombstoneAppliedAfterItsPut(t *testing.T) {
+	kd := NewKeyDir()
+
+	applyRecord(kd, 0, 0, &Record{Timestamp: 100, Key: []byte("user:1"), Value: []byte("alice")})
+	applyRecord(kd, 1, 0, &Record{Timestamp: 200, Flags: flagTombstone, Key: []byte("user:1")})
+
+	if _, ok := kd.Get([]byte("user:1")); ok {
+		t.Errorf("key survived a newer tombstone")
+	}
+}
+
+// TestTombstoneOrderingIsNotSymmetric documents a known limit: Delete removes the
+// entry outright, so a tombstone leaves no timestamp and an older put replayed
+// after it wins. Replay must therefore still deliver records oldest-first, which
+// constrains what file id merge output can take.
+func TestTombstoneOrderingIsNotSymmetric(t *testing.T) {
+	kd := NewKeyDir()
+
+	// the reverse of TestTombstoneAppliedAfterItsPut: newer tombstone first
+	applyRecord(kd, 1, 0, &Record{Timestamp: 200, Flags: flagTombstone, Key: []byte("user:1")})
+	applyRecord(kd, 0, 0, &Record{Timestamp: 100, Key: []byte("user:1"), Value: []byte("alice")})
+
+	if _, ok := kd.Get([]byte("user:1")); !ok {
+		t.Skip("tombstones now carry a timestamp — update this test and the merge design")
 	}
 }

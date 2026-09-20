@@ -160,8 +160,10 @@ func TestApplyRecordStaleIgnored(t *testing.T) {
 }
 
 // TestApplyRecordEqualTimestampLaterWins pins the strict > in the staleness
-// check. Two writes can land in the same nanosecond, and skipping the second
-// one would be a lost write.
+// check. Timestamps are now assigned monotonically, so two records written by
+// this code can no longer tie — but applyRecord is also fed records off disk,
+// which may predate that guarantee or come from a damaged file, so the strict >
+// stays. Relaxing it to >= would drop the second of any pair that did tie.
 func TestApplyRecordEqualTimestampLaterWins(t *testing.T) {
 	kd := NewKeyDir()
 	key := []byte("user:1")
@@ -279,7 +281,7 @@ func TestLoadKeyDirAcrossFiles(t *testing.T) {
 		t.Fatalf("Close 1 failed: %v", err)
 	}
 
-	kd, highestID, _, err := loadKeyDir(dir)
+	kd, highestID, _, _, err := loadKeyDir(dir)
 	if err != nil {
 		t.Fatalf("loadKeyDir failed: %v", err)
 	}
@@ -309,7 +311,7 @@ func TestLoadKeyDirAcrossFiles(t *testing.T) {
 
 // TestLoadKeyDirEmptyDir checks that recovery over nothing is a new database.
 func TestLoadKeyDirEmptyDir(t *testing.T) {
-	kd, highestID, _, err := loadKeyDir(t.TempDir())
+	kd, highestID, _, _, err := loadKeyDir(t.TempDir())
 	if err != nil {
 		t.Fatalf("loadKeyDir failed: %v", err)
 	}
@@ -366,7 +368,7 @@ func TestLoadKeyDirStopsAtTornTail(t *testing.T) {
 		t.Fatalf("Truncate failed: %v", err)
 	}
 
-	kd, _, _, err := loadKeyDir(dir)
+	kd, _, _, _, err := loadKeyDir(dir)
 	if err != nil {
 		t.Fatalf("loadKeyDir on a torn tail failed: %v", err)
 	}
