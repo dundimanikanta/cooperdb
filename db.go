@@ -86,24 +86,29 @@ type DB struct {
 func Open(dir string, opts ...Option) (*DB, error) {
 	// replay whatever is already on disk; an empty directory gives back an
 	// empty keydir and id 0, which is a new database rather than an error
-	keyd, activeID, activeValidLen, previousMaxTimestamp, err := loadKeyDir(dir)
+	keyd, activeID, lastValidLen, previousMaxTimestamp, err := loadKeyDir(dir)
 	if err != nil {
 		return nil, err
 	}
 
-	// a crash can leave a partial record at the tail. The scan above stopped
-	// before it, so the file is longer than its valid data — and OpenDataFile
-	// seeds the write offset from the file's SIZE, which would put the next
-	// record after the damage rather than over it. Everything written after
-	// would then be invisible to the next scan, because records are found by
-	// chaining from the previous one.
-	err = truncateToValid(dir, activeID, activeValidLen)
-	if err != nil {
-		return nil, err
+	// 0 means the directory held no data files, so there is nothing to trim
+	if activeID > 0 {
+		// housekeeping now, not the chain-break fix it was: nothing appends to
+		// that file again, so this only keeps its size equal to its valid length
+		err = truncateToValid(dir, activeID-1, lastValidLen)
+		if err != nil {
+			return nil, err
+		}
+
+		// nothing readable in it, so no keydir entry points into it — take it
+		// over rather than leaving an empty file behind on every restart
+		if lastValidLen == 0 {
+			activeID--
+		}
 	}
 
-	// appends continue into the newest file, and OpenDataFile seeds its write
-	// offset from the file's size — now equal to the valid length
+	// never the highest one on disk: merge output takes a high id, and appending
+	// into a file merge owns would interleave records
 	dataf, err := OpenDataFile(dir, activeID, createIfMissing)
 	if err != nil {
 		return nil, err

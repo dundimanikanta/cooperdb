@@ -1720,3 +1720,205 @@ func TestRotateSkipsAnAllocatedID(t *testing.T) {
 		t.Errorf("rotation opened file %d, already reserved by another caller", claimed)
 	}
 }
+
+// TestOpenFreshDatabaseStartsAtFileZero checks an empty directory begins at 000000.
+func TestOpenFreshDatabaseStartsAtFileZero(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	if db.dataFile.id != 0 {
+		t.Errorf("active id = %d, want 0", db.dataFile.id)
+	}
+}
+
+// TestOpenAllocatesAFreshActiveFile checks a restart writes into a new file rather
+// than appending to the one it found.
+func TestOpenAllocatesAFreshActiveFile(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	firstID := db.dataFile.id
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	db2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer db2.Close()
+
+	if db2.dataFile.id == firstID {
+		t.Errorf("reopen took over file %d instead of starting a new one", firstID)
+	}
+
+	if db2.dataFile.offset != 0 {
+		t.Errorf("new active file starts at offset %d, want 0", db2.dataFile.offset)
+	}
+
+	// the data still has to be there, read out of the older file
+	got, err := db2.Get([]byte("user:1"))
+	if err != nil {
+		t.Fatalf("Get after reopen failed: %v", err)
+	}
+
+	if !bytes.Equal(got, []byte("alice")) {
+		t.Errorf("Get = %q, want %q", got, "alice")
+	}
+}
+
+// TestOpenDoesNotAppendIntoTheHighestFile is the merge hazard: a high id belongs to
+// merge output, and Open taking it over would interleave records into it.
+func TestOpenDoesNotAppendIntoTheHighestFile(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// as Merge will leave it: a file numbered well above the active one
+	mergeOutput, err := OpenDataFile(dir, 9, createIfMissing)
+	if err != nil {
+		t.Fatalf("OpenDataFile 9 failed: %v", err)
+	}
+
+	_, err = mergeOutput.Append(&Record{Timestamp: 500, Key: []byte("merged"), Value: []byte("value")})
+	if err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	sizeBefore := mergeOutput.offset
+
+	err = mergeOutput.Close()
+	if err != nil {
+		t.Fatalf("Close 9 failed: %v", err)
+	}
+
+	db2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer db2.Close()
+
+	if db2.dataFile.id <= 9 {
+		t.Errorf("active id = %d, want above the merge output at 9", db2.dataFile.id)
+	}
+
+	err = db2.Put([]byte("after"), []byte("restart"))
+	if err != nil {
+		t.Fatalf("Put after reopen failed: %v", err)
+	}
+
+	fi, err := os.Stat(filepath.Join(dir, "000009.data"))
+	if err != nil {
+		t.Fatalf("Stat 000009.data failed: %v", err)
+	}
+
+	if fi.Size() != sizeBefore {
+		t.Errorf("merge output grew from %d to %d bytes", sizeBefore, fi.Size())
+	}
+}
+
+// TestOpenReusesAnEmptyActiveFile checks a restart that wrote nothing does not
+// leave a file behind, so repeated opens cannot grow the directory without bound.
+func TestOpenReusesAnEmptyActiveFile(t *testing.T) {
+	dir := t.TempDir()
+
+	for i := 0; i < 5; i++ {
+		db, err := Open(dir)
+		if err != nil {
+			t.Fatalf("Open %d failed: %v", i, err)
+		}
+
+		if db.dataFile.id != 0 {
+			t.Errorf("open %d: active id = %d, want 0 — the empty file should be reused", i, db.dataFile.id)
+		}
+
+		err = db.Close()
+		if err != nil {
+			t.Fatalf("Close %d failed: %v", i, err)
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Errorf("%d files after 5 open/close cycles, want 1", len(entries))
+	}
+}
+
+// TestOpenDoesNotReuseAFileHoldingRecords checks the reuse is limited to files with
+// nothing readable in them — anything the keydir points into must be left alone.
+func TestOpenDoesNotReuseAFileHoldingRecords(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	err = db.Put([]byte("user:1"), []byte("alice"))
+	if err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	written := db.dataFile.id
+	sizeBefore := db.dataFile.offset
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	db2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer db2.Close()
+
+	if db2.dataFile.id == written {
+		t.Fatalf("reopen took over file %d, which holds a record", written)
+	}
+
+	err = db2.Put([]byte("user:2"), []byte("bob"))
+	if err != nil {
+		t.Fatalf("Put after reopen failed: %v", err)
+	}
+
+	fi, err := os.Stat(filepath.Join(dir, fmt.Sprintf("%06d.data", written)))
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+
+	if fi.Size() != sizeBefore {
+		t.Errorf("file %d grew from %d to %d bytes", written, sizeBefore, fi.Size())
+	}
+}

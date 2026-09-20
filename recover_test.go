@@ -282,13 +282,14 @@ func TestLoadKeyDirAcrossFiles(t *testing.T) {
 		t.Fatalf("Close 1 failed: %v", err)
 	}
 
-	kd, highestID, _, _, err := loadKeyDir(dir)
+	kd, nextID, _, _, err := loadKeyDir(dir)
 	if err != nil {
 		t.Fatalf("loadKeyDir failed: %v", err)
 	}
 
-	if highestID != 1 {
-		t.Errorf("highestID = %d, want 1", highestID)
+	// files 0 and 1 are taken, so the first free id is 2
+	if nextID != 2 {
+		t.Errorf("nextID = %d, want 2", nextID)
 	}
 
 	if kd.Len() != 1 {
@@ -312,7 +313,7 @@ func TestLoadKeyDirAcrossFiles(t *testing.T) {
 
 // TestLoadKeyDirEmptyDir checks that recovery over nothing is a new database.
 func TestLoadKeyDirEmptyDir(t *testing.T) {
-	kd, highestID, _, _, err := loadKeyDir(t.TempDir())
+	kd, nextID, _, _, err := loadKeyDir(t.TempDir())
 	if err != nil {
 		t.Fatalf("loadKeyDir failed: %v", err)
 	}
@@ -325,8 +326,9 @@ func TestLoadKeyDirEmptyDir(t *testing.T) {
 		t.Errorf("keydir Len = %d, want 0", kd.Len())
 	}
 
-	if highestID != 0 {
-		t.Errorf("highestID = %d, want 0", highestID)
+	// nothing on disk, so the first free id is 0 and the database starts there
+	if nextID != 0 {
+		t.Errorf("nextID = %d, want 0", nextID)
 	}
 }
 

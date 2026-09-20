@@ -42,16 +42,15 @@ func dataFileIDs(dir string) ([]uint32, error) {
 	return ids, nil
 }
 
-// loadKeyDir replays every data file in dir and returns the keydir it
-// reconstructs, the highest file id seen so the caller knows which file to
-// reopen as active, and that file's valid-data length — which is NOT its size
-// when a crash left a partial record at the tail.
+// loadKeyDir replays every data file in dir and returns the keydir, the first
+// unused file id (0 when the directory is empty), the last file's valid-data
+// length — not its size, after a torn tail — and the highest timestamp seen.
 func loadKeyDir(dir string) (*KeyDir, uint32, int64, int64, error) {
 	// an empty directory is a new database, not a failure, so these are what a
 	// caller gets when the loop below never runs
 	kd := NewKeyDir()
-	highestID := uint32(0)
-	activeValidLen := int64(0)
+	nextID := uint32(0)
+	lastValidLen := int64(0)
 	maxTimestamp := int64(0)
 
 	ids, err := dataFileIDs(dir)
@@ -86,17 +85,17 @@ func loadKeyDir(dir string) (*KeyDir, uint32, int64, int64, error) {
 			return nil, 0, 0, 0, err
 		}
 
-		// ids arrive sorted, so the last one seen is the highest — and the last
-		// iteration's valid length belongs to the file that becomes active
-		highestID = id
-		activeValidLen = validLen
+		// ids arrive sorted, so the last iteration holds the highest id and the
+		// valid length of the file that was most recently written
+		nextID = id + 1
+		lastValidLen = validLen
 	}
 
 	// the tombstone entries have done their work; what is handed back holds live
 	// keys only, which is what Get, Len and merge all assume
 	kd.dropTombstones()
 
-	return kd, highestID, activeValidLen, maxTimestamp, nil
+	return kd, nextID, lastValidLen, maxTimestamp, nil
 }
 
 // applyRecord folds one replayed record into the keydir.
