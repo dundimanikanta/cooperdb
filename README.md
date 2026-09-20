@@ -101,6 +101,37 @@ before it is intact, so recovery takes what it can read and stops. Treating that
 as corruption would make a single ungraceful shutdown render the database
 permanently unopenable.
 
+**And the damage is then removed**, before anything is appended. `Open`
+truncates the active file to the length the scan could actually read, rather
+than to the length the filesystem reports — those differ by exactly the size of
+the partial record.
+
+That distinction matters more than it looks. Records carry no start marker: each
+one is found by reading the previous one's header and stepping forward by its
+length. Append *past* a partial record rather than over it, and the chain
+breaks — every record written afterwards is durably on disk and permanently
+unfindable, because the next scan stops at the same damaged byte and can never
+reach them. The loss then surfaces one restart *after* the crash that caused it.
+
+A write that fails partway is cleaned up the same way, immediately: the partial
+bytes are truncated away before `Put` returns its error, so the file and the
+in-memory write offset never disagree.
+
+### Known limit: damage in the middle of a file
+
+Recovery handles a damaged **tail**, which is the shape a crash produces.
+Damage in the **middle** of a file — bit rot, a bad backup restore, a truncated
+copy — is not recoverable: the scan stops there, and every record after it
+becomes unreachable.
+
+The reason is the same chaining property. Finding the next record after
+unreadable bytes would mean guessing offsets and CRC-checking each until one
+validated, and this format has no support for that. Bitcask has the same limit.
+
+In practice this needs damage cooperdb did not cause, since both the crash case
+and the failed-write case are truncated away before anything is written past
+them.
+
 ## Record format
 
 All integers little-endian.
