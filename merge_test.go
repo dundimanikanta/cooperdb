@@ -1,6 +1,11 @@
 package cooperdb
 
-import "testing"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // TestMergeableFilesExcludesTheActiveFile checks the file still being appended to
 // is never offered up for merging.
@@ -215,5 +220,357 @@ func TestIsLiveMatchesOneCopyPerKey(t *testing.T) {
 
 	if live != 1 {
 		t.Errorf("%d of 4 copies read as live, want 1", live)
+	}
+}
+
+// copyFixtureDeleted are the keys copyFixture deletes and never writes again.
+var copyFixtureDeleted = []int{1, 15, 29}
+
+// copyFixture fills a database whose sealed files hold superseded records and
+// tombstones, and returns it alongside the merge inputs.
+func copyFixture(t *testing.T, dir string) (*DB, []uint32) {
+	t.Helper()
+
+	db, err := Open(dir, WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	key := func(i int) []byte { return []byte(fmt.Sprintf("k%03d", i)) }
+
+	for i := 0; i < 30; i++ {
+		if err := db.Put(key(i), []byte(fmt.Sprintf("v%03d-original", i))); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	// odd keys only, so the even-key rewrite below never brings them back
+	for _, i := range copyFixtureDeleted {
+		if err := db.Delete(key(i)); err != nil {
+			t.Fatalf("Delete failed: %v", err)
+		}
+	}
+
+	for i := 0; i < 30; i += 2 {
+		if err := db.Put(key(i), []byte(fmt.Sprintf("v%03d-updated", i))); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	// padding, so everything above is sealed rather than left in the active file
+	for i := 100; i < 120; i++ {
+		if err := db.Put(key(i), []byte("padding-padding-padding")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	inputs, err := db.mergeableFiles()
+	if err != nil {
+		t.Fatalf("mergeableFiles failed: %v", err)
+	}
+
+	if len(inputs) < 2 {
+		t.Fatalf("only %d input file(s); the fixture did not rotate enough", len(inputs))
+	}
+
+	return db, inputs
+}
+
+// inputBytes totals the size of the given data files.
+func inputBytes(t *testing.T, dir string, ids []uint32) int64 {
+	t.Helper()
+
+	total := int64(0)
+	for _, id := range ids {
+		fi, err := os.Stat(filepath.Join(dir, fmt.Sprintf("%06d.data", id)))
+		if err != nil {
+			t.Fatalf("Stat %d failed: %v", id, err)
+		}
+		total += fi.Size()
+	}
+
+	return total
+}
+
+// TestCopyLiveRecordsReclaimsSpace checks the output is smaller than the inputs, which
+// is the only reason merge exists.
+func TestCopyLiveRecordsReclaimsSpace(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	before := inputBytes(t, dir, inputs)
+
+	output, _, err := db.copyLiveRecords(inputs)
+	if err != nil {
+		t.Fatalf("copyLiveRecords failed: %v", err)
+	}
+	defer output.Close()
+
+	if output.offset >= before {
+		t.Errorf("output is %d bytes against %d of input — nothing was reclaimed", output.offset, before)
+	}
+}
+
+// TestCopyLiveRecordsOutputTakesAFreshHighID checks the output never lands on a file
+// that already exists.
+func TestCopyLiveRecordsOutputTakesAFreshHighID(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	before, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	output, _, err := db.copyLiveRecords(inputs)
+	if err != nil {
+		t.Fatalf("copyLiveRecords failed: %v", err)
+	}
+	defer output.Close()
+
+	for _, id := range before {
+		if output.id == id {
+			t.Fatalf("output reused existing file id %d", id)
+		}
+	}
+
+	if output.id <= db.dataFile.id {
+		t.Errorf("output id %d is not above the active file %d", output.id, db.dataFile.id)
+	}
+}
+
+// TestCopyLiveRecordsKeepsOnlyLiveRecords checks each relocated key appears exactly
+// once in the output and is still live in the keydir.
+func TestCopyLiveRecordsKeepsOnlyLiveRecords(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	output, relocations, err := db.copyLiveRecords(inputs)
+	if err != nil {
+		t.Fatalf("copyLiveRecords failed: %v", err)
+	}
+	defer output.Close()
+
+	seen := make(map[string]int)
+	puts := 0
+
+	_, err = output.Scan(func(offset int64, r *Record) error {
+		if r.IsTombstone() {
+			return nil
+		}
+		puts++
+		seen[string(r.Key)]++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scanning the output failed: %v", err)
+	}
+
+	if puts != len(relocations) {
+		t.Errorf("%d records in the output against %d relocations", puts, len(relocations))
+	}
+
+	for key, count := range seen {
+		if count != 1 {
+			t.Errorf("%s appears %d times in the output, want 1", key, count)
+		}
+		if _, ok := db.keyDirectory.Get([]byte(key)); !ok {
+			t.Errorf("%s was copied but is not a live key", key)
+		}
+	}
+}
+
+// TestCopyLiveRecordsPreservesTimestamps is the one that matters most: a re-stamped
+// record would beat the live one during replay and resurrect an old value.
+func TestCopyLiveRecordsPreservesTimestamps(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	output, relocations, err := db.copyLiveRecords(inputs)
+	if err != nil {
+		t.Fatalf("copyLiveRecords failed: %v", err)
+	}
+	defer output.Close()
+
+	// the keydir holds each live record's original timestamp, so the copy must match it
+	for key, moved := range relocations {
+		original, ok := db.keyDirectory.Get([]byte(key))
+		if !ok {
+			t.Errorf("%s is not in the keydir", key)
+			continue
+		}
+		if moved.Timestamp != original.Timestamp {
+			t.Errorf("%s: copied timestamp %d, original %d", key, moved.Timestamp, original.Timestamp)
+		}
+	}
+
+	_, err = output.Scan(func(offset int64, r *Record) error {
+		if r.IsTombstone() {
+			return nil
+		}
+		moved := relocations[string(r.Key)]
+		if moved.Timestamp != r.Timestamp {
+			t.Errorf("%s: record on disk has timestamp %d, relocation says %d", r.Key, r.Timestamp, moved.Timestamp)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scanning the output failed: %v", err)
+	}
+}
+
+// TestCopyLiveRecordsRelocationsNameTheRecords checks every relocation points at the
+// record actually written, so the keydir update in step 4 has something valid to use.
+func TestCopyLiveRecordsRelocationsNameTheRecords(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	output, relocations, err := db.copyLiveRecords(inputs)
+	if err != nil {
+		t.Fatalf("copyLiveRecords failed: %v", err)
+	}
+	defer output.Close()
+
+	for key, moved := range relocations {
+		if moved.FileID != output.id {
+			t.Errorf("%s points at file %d, want the output %d", key, moved.FileID, output.id)
+		}
+
+		r, err := output.ReadAt(moved.Offset, moved.Size)
+		if err != nil {
+			t.Errorf("%s: reading back at offset %d size %d: %v", key, moved.Offset, moved.Size, err)
+			continue
+		}
+
+		if string(r.Key) != key {
+			t.Errorf("offset %d holds key %q, relocation says %q", moved.Offset, r.Key, key)
+		}
+	}
+}
+
+// TestCopyLiveRecordsCopiesTombstones checks deletions survive the merge, without
+// becoming keydir entries for keys that are supposed to be gone.
+func TestCopyLiveRecordsCopiesTombstones(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	output, relocations, err := db.copyLiveRecords(inputs)
+	if err != nil {
+		t.Fatalf("copyLiveRecords failed: %v", err)
+	}
+	defer output.Close()
+
+	found := make(map[string]bool)
+	_, err = output.Scan(func(offset int64, r *Record) error {
+		if r.IsTombstone() {
+			found[string(r.Key)] = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scanning the output failed: %v", err)
+	}
+
+	// a key deleted and then written again keeps both records, so only the keys
+	// that stayed deleted can be checked for absence from the keydir
+	for _, i := range copyFixtureDeleted {
+		key := fmt.Sprintf("k%03d", i)
+
+		if !found[key] {
+			t.Errorf("no tombstone for %s in the output, so it would come back on restart", key)
+		}
+
+		if _, ok := relocations[key]; ok {
+			t.Errorf("deleted key %s was recorded as a relocation", key)
+		}
+
+		if _, ok := db.keyDirectory.Get([]byte(key)); ok {
+			t.Errorf("%s is still live in the keydir, so the fixture did not delete it", key)
+		}
+	}
+}
+
+// TestCopyLiveRecordsWithNoInputs checks an empty merge creates no output file.
+func TestCopyLiveRecordsWithNoInputs(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	before, err := dataFileIDs(db.directory)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	output, relocations, err := db.copyLiveRecords(nil)
+	if err != nil {
+		t.Fatalf("copyLiveRecords failed: %v", err)
+	}
+
+	if output != nil {
+		t.Errorf("an output file was created for an empty merge")
+	}
+
+	if len(relocations) != 0 {
+		t.Errorf("relocations = %v, want none", relocations)
+	}
+
+	after, err := dataFileIDs(db.directory)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(after) != len(before) {
+		t.Errorf("%d files before, %d after an empty merge", len(before), len(after))
+	}
+}
+
+// TestCopyLiveRecordsAbortsOnAnUnreadableInput checks a file it cannot read fails the
+// merge rather than being skipped — the caller deletes the inputs, so a skipped file
+// would take its live records with it.
+func TestCopyLiveRecordsAbortsOnAnUnreadableInput(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	missing := inputs[len(inputs)/2]
+	err := os.Remove(filepath.Join(dir, fmt.Sprintf("%06d.data", missing)))
+	if err != nil {
+		t.Fatalf("removing input %d failed: %v", missing, err)
+	}
+
+	before, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	output, relocations, err := db.copyLiveRecords(inputs)
+	if err == nil {
+		t.Errorf("copyLiveRecords succeeded with input %d missing", missing)
+	}
+
+	// a failed merge must leave nothing a later scan would take for a data file
+	after, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(after) != len(before) {
+		t.Errorf("files went from %v to %v — the failed merge left its output behind", before, after)
+	}
+
+	if output != nil {
+		t.Errorf("an output file was handed back alongside the error")
+	}
+
+	if relocations != nil {
+		t.Errorf("relocations = %v, want nil on failure", relocations)
 	}
 }

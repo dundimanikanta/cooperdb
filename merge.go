@@ -1,5 +1,11 @@
 package cooperdb
 
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
 // mergeableFiles returns the ids of every data file except the active one,
 // which is excluded because it is still being appended to.
 func (db *DB) mergeableFiles() ([]uint32, error) {
@@ -38,4 +44,70 @@ func (db *DB) isLive(fileID uint32, offset int64, r *Record) bool {
 	}
 	return true
 
+}
+
+// copyLiveRecords walks every input file in order and appends the records worth
+// keeping to one new output file, reporting where each of them landed.
+func (db *DB) copyLiveRecords(inputs []uint32) (*DataFile, map[string]Entry, error) {
+
+	if len(inputs) == 0 {
+		return nil, nil, nil
+	}
+
+	relocations := make(map[string]Entry)
+
+	output, err := OpenDataFile(db.directory, db.nextFileID(), createIfMissing)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, id := range inputs {
+
+		// aborts rather than skips: the caller deletes these files
+		input, err := OpenDataFile(db.directory, id, dontCreateIfMissing)
+		if err != nil {
+			output.Close()
+			os.Remove(filepath.Join(db.directory, fmt.Sprintf("%06d.data", output.id)))
+			return nil, nil, err
+		}
+
+		_, err = input.Scan(func(offset int64, r *Record) error {
+
+			// copied whatever the keydir says, but never a relocation: a deleted
+			// key has no entry to repoint
+			if r.IsTombstone() {
+				_, appendErr := output.Append(r)
+				return appendErr
+			}
+
+			if !db.isLive(id, offset, r) {
+				return nil
+			}
+
+			// unchanged: a fresh timestamp would beat the live record on replay
+			newOffset, appendErr := output.Append(r)
+			if appendErr != nil {
+				return appendErr
+			}
+
+			relocations[string(r.Key)] = Entry{
+				FileID:    output.id,
+				Offset:    newOffset,
+				Size:      RecordSize(len(r.Key), len(r.Value)),
+				Timestamp: r.Timestamp,
+			}
+
+			return nil
+		})
+
+		input.Close()
+
+		if err != nil {
+			output.Close()
+			os.Remove(filepath.Join(db.directory, fmt.Sprintf("%06d.data", output.id)))
+			return nil, nil, err
+		}
+	}
+
+	return output, relocations, nil
 }
