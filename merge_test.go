@@ -1288,3 +1288,55 @@ func TestStrayMergeFileIsInvisibleToRecovery(t *testing.T) {
 		t.Errorf("dataFileIDs went from %v to %v — the scratch file is visible to recovery", before, after)
 	}
 }
+
+// TestMergeLeavesNoScratchFile checks the output is renamed, not left under the
+// name it was written with.
+func TestMergeLeavesNoScratchFile(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := copyFixture(t, dir)
+	defer db.Close()
+
+	err := db.Merge()
+	if err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+
+	strays, err := filepath.Glob(filepath.Join(dir, "*.merge.tmp"))
+	if err != nil {
+		t.Fatalf("Glob failed: %v", err)
+	}
+
+	if len(strays) != 0 {
+		t.Errorf("a successful merge left %v behind", strays)
+	}
+
+	// and the output is reachable under its real name
+	entry, ok := db.keyDirectory.Get([]byte("k002"))
+	if !ok {
+		t.Fatalf("k002 is missing from the keydir")
+	}
+
+	_, err = os.Stat(filepath.Join(dir, fmt.Sprintf("%06d.data", entry.FileID)))
+	if err != nil {
+		t.Errorf("the file the keydir names does not exist: %v", err)
+	}
+}
+
+// TestSyncDir checks the directory flush works on a real directory and reports a
+// missing one rather than silently succeeding.
+func TestSyncDir(t *testing.T) {
+	dir := t.TempDir()
+
+	err := os.WriteFile(filepath.Join(dir, "000000.data"), []byte("x"), 0644)
+	if err != nil {
+		t.Fatalf("writing a file failed: %v", err)
+	}
+
+	if err := syncDir(dir); err != nil {
+		t.Errorf("syncDir on a real directory: %v", err)
+	}
+
+	if err := syncDir(filepath.Join(dir, "no-such-directory")); err == nil {
+		t.Errorf("syncDir on a missing directory reported success")
+	}
+}
