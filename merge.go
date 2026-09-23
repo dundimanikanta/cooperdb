@@ -111,3 +111,28 @@ func (db *DB) copyLiveRecords(inputs []uint32) (*DataFile, map[string]Entry, err
 
 	return output, relocations, nil
 }
+
+// applyRelocations points each copied key at its new home, skipping any the keydir
+// no longer names, and reports how many were applied.
+func (db *DB) applyRelocations(relocations map[string]Entry) int {
+
+	// how many were actually repointed
+	applied := 0
+
+	// iterating over the the relocations map
+	for key, moved := range relocations {
+
+		current, ok := db.keyDirectory.Get([]byte(key))
+
+		// checking if anything has been chnaged in the active keydir during the merge
+		// either deleted or updated we skip the copying to active keydir
+		if !ok || current.Timestamp != moved.Timestamp {
+			continue
+		}
+
+		db.keyDirectory.Put([]byte(key), moved)
+		applied++
+	}
+
+	return applied
+}

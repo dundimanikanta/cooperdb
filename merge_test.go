@@ -574,3 +574,146 @@ func TestCopyLiveRecordsAbortsOnAnUnreadableInput(t *testing.T) {
 		t.Errorf("relocations = %v, want nil on failure", relocations)
 	}
 }
+
+// TestApplyRelocationsRepointsUnchangedKeys checks the ordinary case: every key the
+// keydir still names is moved to the copy in the output file.
+func TestApplyRelocationsRepointsUnchangedKeys(t *testing.T) {
+	db := keydirOnlyDB()
+	relocations := make(map[string]Entry)
+
+	for i, key := range []string{"a", "b", "c", "d"} {
+		timestamp := int64(100 + i)
+		db.keyDirectory.Put([]byte(key), Entry{FileID: 1, Offset: int64(i * 30), Size: 30, Timestamp: timestamp})
+		relocations[key] = Entry{FileID: 9, Offset: int64(i * 20), Size: 30, Timestamp: timestamp}
+	}
+
+	applied := db.applyRelocations(relocations)
+
+	if applied != len(relocations) {
+		t.Errorf("applied = %d, want %d", applied, len(relocations))
+	}
+
+	for key, moved := range relocations {
+		got, ok := db.keyDirectory.Get([]byte(key))
+		if !ok {
+			t.Errorf("%s went missing", key)
+			continue
+		}
+
+		if got.FileID != moved.FileID || got.Offset != moved.Offset {
+			t.Errorf("%s = {file %d, offset %d}, want {%d, %d}", key, got.FileID, got.Offset, moved.FileID, moved.Offset)
+		}
+	}
+}
+
+// TestApplyRelocationsKeepsANewerWrite checks a key written during the merge is not
+// reverted to the copy, which holds the value as it was when the merge started.
+func TestApplyRelocationsKeepsANewerWrite(t *testing.T) {
+	db := keydirOnlyDB()
+
+	db.keyDirectory.Put([]byte("user:1"), Entry{FileID: 1, Offset: 0, Size: 30, Timestamp: 100})
+	relocations := map[string]Entry{
+		"user:1": {FileID: 9, Offset: 0, Size: 30, Timestamp: 100},
+	}
+
+	// the write that lands while the merge is copying
+	db.keyDirectory.Put([]byte("user:1"), Entry{FileID: 5, Offset: 512, Size: 40, Timestamp: 500})
+
+	applied := db.applyRelocations(relocations)
+
+	if applied != 0 {
+		t.Errorf("applied = %d, want 0 — the relocation was stale", applied)
+	}
+
+	got, ok := db.keyDirectory.Get([]byte("user:1"))
+	if !ok {
+		t.Fatalf("user:1 went missing")
+	}
+
+	if got.FileID != 5 || got.Timestamp != 500 {
+		t.Errorf("user:1 = {file %d, ts %d}, want {5, 500} — the stale relocation overwrote a newer write",
+			got.FileID, got.Timestamp)
+	}
+}
+
+// TestApplyRelocationsDoesNotResurrectADeletedKey checks a key deleted during the
+// merge stays deleted, even though its record was copied into the output.
+func TestApplyRelocationsDoesNotResurrectADeletedKey(t *testing.T) {
+	db := keydirOnlyDB()
+
+	db.keyDirectory.Put([]byte("user:1"), Entry{FileID: 1, Offset: 0, Size: 30, Timestamp: 100})
+	relocations := map[string]Entry{
+		"user:1": {FileID: 9, Offset: 0, Size: 30, Timestamp: 100},
+	}
+
+	// the delete that lands while the merge is copying
+	db.keyDirectory.Delete([]byte("user:1"))
+
+	applied := db.applyRelocations(relocations)
+
+	if applied != 0 {
+		t.Errorf("applied = %d, want 0 — the key was deleted", applied)
+	}
+
+	if _, ok := db.keyDirectory.Get([]byte("user:1")); ok {
+		t.Errorf("user:1 was brought back by its relocation")
+	}
+}
+
+// TestApplyRelocationsSkipsOnlyTheStaleOnes checks one changed key does not abandon
+// the rest — the guards continue rather than return.
+func TestApplyRelocationsSkipsOnlyTheStaleOnes(t *testing.T) {
+	db := keydirOnlyDB()
+	relocations := make(map[string]Entry)
+
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("k%d", i)
+		timestamp := int64(100 + i)
+		db.keyDirectory.Put([]byte(key), Entry{FileID: 1, Offset: int64(i * 30), Size: 30, Timestamp: timestamp})
+		relocations[key] = Entry{FileID: 9, Offset: int64(i * 30), Size: 30, Timestamp: timestamp}
+	}
+
+	// one deleted and one overwritten, leaving eight untouched
+	db.keyDirectory.Delete([]byte("k3"))
+	db.keyDirectory.Put([]byte("k7"), Entry{FileID: 5, Offset: 0, Size: 30, Timestamp: 999})
+
+	applied := db.applyRelocations(relocations)
+
+	if applied != 8 {
+		t.Errorf("applied = %d, want 8", applied)
+	}
+
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("k%d", i)
+		got, ok := db.keyDirectory.Get([]byte(key))
+
+		switch key {
+		case "k3":
+			if ok {
+				t.Errorf("k3 was resurrected")
+			}
+		case "k7":
+			if !ok || got.FileID != 5 {
+				t.Errorf("k7 = {file %d}, want the newer write in file 5", got.FileID)
+			}
+		default:
+			if !ok || got.FileID != 9 {
+				t.Errorf("%s = {file %d}, want the output file 9", key, got.FileID)
+			}
+		}
+	}
+}
+
+// TestApplyRelocationsOnAnEmptyMap checks a merge with nothing to repoint is not an error.
+func TestApplyRelocationsOnAnEmptyMap(t *testing.T) {
+	db := keydirOnlyDB()
+	db.keyDirectory.Put([]byte("user:1"), Entry{FileID: 1, Offset: 0, Size: 30, Timestamp: 100})
+
+	if applied := db.applyRelocations(nil); applied != 0 {
+		t.Errorf("applied = %d, want 0", applied)
+	}
+
+	if db.keyDirectory.Len() != 1 {
+		t.Errorf("keydir Len = %d, want 1 — an empty merge changed the keydir", db.keyDirectory.Len())
+	}
+}
