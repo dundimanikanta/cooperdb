@@ -56,7 +56,7 @@ func (db *DB) copyLiveRecords(inputs []uint32) (*DataFile, map[string]Entry, err
 
 	relocations := make(map[string]Entry)
 
-	output, err := OpenDataFile(db.directory, db.nextFileID(), createIfMissing)
+	output, err := OpenMergeFile(db.directory, db.nextFileID(), createIfMissing)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -67,7 +67,7 @@ func (db *DB) copyLiveRecords(inputs []uint32) (*DataFile, map[string]Entry, err
 		input, err := OpenDataFile(db.directory, id, dontCreateIfMissing)
 		if err != nil {
 			output.Close()
-			os.Remove(filepath.Join(db.directory, fmt.Sprintf("%06d.data", output.id)))
+			os.Remove(filepath.Join(db.directory, fmt.Sprintf("%06d.merge.tmp", output.id)))
 			return nil, nil, err
 		}
 
@@ -104,12 +104,48 @@ func (db *DB) copyLiveRecords(inputs []uint32) (*DataFile, map[string]Entry, err
 
 		if err != nil {
 			output.Close()
-			os.Remove(filepath.Join(db.directory, fmt.Sprintf("%06d.data", output.id)))
+			os.Remove(filepath.Join(db.directory, fmt.Sprintf("%06d.merge.tmp", output.id)))
 			return nil, nil, err
 		}
 	}
 
 	return output, relocations, nil
+}
+
+func OpenMergeFile(dir string, id uint32, create bool) (*DataFile, error) {
+	// zero-padded so the filenames sort lexically in creation order
+	path := filepath.Join(dir, fmt.Sprintf("%06d.merge.tmp", id))
+
+	// O_APPEND sends every write to EOF atomically; O_RDWR because reads come
+	// back through this same handle
+	flags := os.O_CREATE | os.O_RDWR | os.O_APPEND
+
+	// read-only and no O_CREATE: a missing file errors instead of being made
+	// empty, and the kernel refuses a write rather than trusting nobody tries
+	if !create {
+		flags = os.O_RDONLY
+	}
+
+	f, err := os.OpenFile(path, flags, dataFilePerm)
+	if err != nil {
+		return nil, err
+	}
+
+	// metadata snapshot of the file behind this descriptor, not of the path
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	// starting at the end of what is already there, never at 0
+	offset := fi.Size()
+
+	return &DataFile{
+		file:   f,
+		id:     id,
+		offset: offset,
+	}, nil
 }
 
 // applyRelocations points each copied key at its new home, skipping any the keydir
@@ -189,15 +225,43 @@ func (db *DB) Merge() error {
 	if err != nil {
 		return err
 	}
+	tmpPath := filepath.Join(db.directory, fmt.Sprintf("%06d.merge.tmp", mergeFile.id))
+	finalPath := filepath.Join(db.directory, fmt.Sprintf("%06d.data", mergeFile.id))
 
 	if err := mergeFile.Sync(); err != nil {
 		mergeFile.Close()
-		os.Remove(filepath.Join(db.directory, fmt.Sprintf("%06d.data", mergeFile.id)))
+		os.Remove(tmpPath)
 		return err
 	}
+
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		mergeFile.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+
+	if err := syncDir(db.directory); err != nil {
+		return err
+	}
+
 	db.applyRelocations(relocations)
 
 	mergeFile.Close()
 
 	return db.deleteAlreadyMergedFiles(mergeableFiles)
+}
+
+// syncDir flushes the directory itself, which is what makes a file's *name*
+// durable. Syncing a file's contents says nothing about whether the directory
+// entry naming it survived a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+
+	err = d.Sync()
+	d.Close()
+
+	return err
 }

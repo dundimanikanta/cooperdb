@@ -84,6 +84,18 @@ type DB struct {
 // Open prepares the database in dir for use. Called with no options it syncs
 // never, that being the zero value of SyncPolicy.
 func Open(dir string, opts ...Option) (*DB, error) {
+	// a .merge.tmp is a merge that never committed; its records are all still in
+	// the input files, which it never got as far as deleting
+	strays, err := filepath.Glob(filepath.Join(dir, "*.merge.tmp"))
+	if err != nil {
+		return nil, err
+	}
+
+	for _, stray := range strays {
+		// litter, not a reason to refuse the open
+		os.Remove(stray)
+	}
+
 	// replay whatever is already on disk; an empty directory gives back an
 	// empty keydir and id 0, which is a new database rather than an error
 	keyd, activeID, lastValidLen, previousMaxTimestamp, err := loadKeyDir(dir)
@@ -427,6 +439,11 @@ func (db *DB) rotate() error {
 	newDataFile, err := OpenDataFile(db.directory, db.nextFileID(), createIfMissing)
 
 	if err != nil {
+		return err
+	}
+
+	if err := syncDir(db.directory); err != nil {
+		newDataFile.Close()
 		return err
 	}
 

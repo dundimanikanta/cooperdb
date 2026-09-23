@@ -18,6 +18,7 @@ db, err := cooperdb.Open("./data")
 err = db.Put([]byte("user:1"), []byte("alice"))
 value, err := db.Get([]byte("user:1"))   // ErrKeyNotFound if absent
 err = db.Delete([]byte("user:1"))
+err = db.Merge()                         // reclaim space from dead records
 err = db.Close()
 ```
 
@@ -30,8 +31,10 @@ err = db.Close()
   restart
 - File rotation — the active file is sealed past a size threshold and reads
   resolve across every file
+- Compaction — `Merge` rewrites the sealed files, keeping only what is still
+  live, and deletes the originals
 
-Not yet: compaction and concurrent access.
+Not yet: concurrent access, and `Merge` has to be called by hand.
 
 ## File rotation
 
@@ -44,8 +47,8 @@ db, err := cooperdb.Open("./data", WithMaxFileSize(64<<20))   // 64 MiB
 ```
 
 The default is 2 GiB, which is also Bitcask's. Sealed files are immutable, and
-that immutability is what compaction will need to work on — a single
-ever-growing file would leave it nothing safe to rewrite.
+that immutability is what compaction works on — a single ever-growing file would
+leave it nothing safe to rewrite.
 
 **The threshold should be comfortably larger than your typical record.** A
 record cannot be split across files, so one that exceeds the threshold gets a
@@ -78,22 +81,98 @@ Basho's own guidance for Bitcask is to raise the open-file limit instead.
 The threshold is a runtime setting, not a property of the data. Reopening with a
 different value is fine — existing files keep whatever size they were written at.
 
+## Compaction
+
+An append-only log only grows. Overwriting a key leaves the old record on disk,
+and deleting one *adds* a record. `Merge` reclaims that space: it reads every
+sealed file, writes only the records still being served into a new file, and
+deletes the originals.
+
+```go
+err = db.Merge()
+```
+
+On a database of 200 keys each written four times with a tenth deleted:
+
+| | files | bytes |
+|---|---:|---:|
+| before | 41 | 41,300 |
+| after | 2 | 9,680 |
+
+**Whether a record survives is decided by the keydir, not by reading the log.**
+For each record, merge asks whether the keydir still points at *this* file and
+*this* offset. Matching on location rather than on timestamps makes it an exact
+identity check — a file id plus a byte offset names one record and nothing else,
+because file ids are allocated from a counter that never reuses one.
+
+**Merge output takes a fresh, high file id.** That inverts the usual assumption
+that a higher-numbered file holds newer data, which is exactly why replay orders
+by timestamp rather than by arrival — see Recovery above. Three things had to be
+true before this was safe: timestamps are unique and monotonic, tombstones carry
+their timestamp through replay, and `Open` starts a fresh active file instead of
+appending into whichever file has the highest id.
+
+**The merged file is flushed before any original is deleted.** That ordering is
+the whole crash-safety story. Delete first and a power loss takes both copies at
+once — the new file still sitting in the page cache, the old ones already gone.
+If the flush fails, the output is discarded and the inputs are left untouched, so
+a failed merge costs nothing and can simply be retried.
+
+### Known limits
+
+**Tombstones are never dropped.** A tombstone can only be discarded once every
+older record for its key is gone too, and that is not yet checked — so merge
+copies all of them forward, every time, and **space held by deletions is never
+reclaimed**. Delete-heavy data ends up with merged files that are mostly
+tombstones.
+
+**There is no trigger.** Merge rewrites every sealed file whether or not there is
+anything to reclaim, so merging twice in a row does the second pass for nothing.
+Fine while `Merge` is called deliberately; it would be wasteful on a timer.
+
+**Output is a single file**, ignoring the rotation threshold, so a large database
+merges into one oversized file.
+
+**A crash mid-merge leaves the partial output behind.** Harmless — its records
+are copies carrying their original timestamps, so they can never beat a later
+write, and the next merge folds the file in and deletes it. But nothing sweeps it
+before then.
+
 ## Recovery
 
 The keydir lives only in memory. `Open` reconstructs it by replaying every data
 file in creation order, which is what makes a write survive the process that
 made it.
 
-Replay walks files in creation order and records in offset order, so the last
-record to touch a key is the one that wins. Filenames are zero-padded
-(`000009.data`, `000010.data`) precisely so a text sort gives that order. A
-tombstone removes its key instead of storing an entry, which is why deletions do
-not come back.
+Replay walks files in creation order and records in offset order. Filenames are
+zero-padded (`000009.data`, `000010.data`) precisely so a text sort gives that
+order.
 
-Every record carries its own timestamp, and a record older than the entry
-already held is skipped. That is redundant while replay order matches write
-order — it stops being redundant once compaction rewrites old records into newly
-created files, at which point file order no longer implies record age.
+**But arrival order is not what decides the winner — the timestamp is.** Every
+record carries one, and a record older than the entry already held is skipped.
+That matters because compaction rewrites old records into *newly created* files,
+so a high file id no longer implies recent data: a relocated record from 2019 can
+be replayed after a write from this morning, and must lose.
+
+Timestamps are assigned monotonically rather than straight from the clock —
+`max(now, last + 1)` — so no two records can share one and none can go backwards
+across a restart or an NTP step. That makes the comparison a total ordering, and
+a total ordering is what lets merge put its output wherever it likes.
+
+**A tombstone is held during replay rather than removing its key immediately.**
+It becomes a keydir entry carrying the deletion's timestamp, and those entries
+are swept before `Open` returns, so the keydir you get holds live keys only and
+costs nothing extra at rest.
+
+The obvious alternative — delete the key the moment a tombstone is replayed —
+has a subtle flaw. Deleting leaves no timestamp behind, so an older record for
+that key arriving later finds nothing to compare against and wins: the deleted
+key comes back holding a stale value, with no error anywhere. Riak's Bitcask
+carried that same bug for years ([issue #82](https://github.com/basho/bitcask/issues/82)),
+and fixing it there needed a new on-disk tombstone format. It was cheap to fix
+here only because a tombstone is an ordinary record with a flag set, so it was
+already carrying a timestamp — the information was on disk all along, and only
+the in-memory side was throwing it away.
 
 **A damaged tail ends the scan rather than failing the open.** A process killed
 mid-write leaves a partial record at the end of the active file; everything

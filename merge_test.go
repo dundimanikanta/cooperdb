@@ -1213,3 +1213,78 @@ func TestMergeIsRefusedWhenPoisoned(t *testing.T) {
 		t.Errorf("Merge on a poisoned database = %v, want the poisoning error", err)
 	}
 }
+
+// TestOpenSweepsStrayMergeFiles checks a merge that never committed leaves nothing
+// behind after the next restart.
+func TestOpenSweepsStrayMergeFiles(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+
+	// a crash between the copy and the rename: the scratch file is on disk and
+	// nothing references it
+	output, _, err := db.copyLiveRecords(inputs)
+	if err != nil {
+		t.Fatalf("copyLiveRecords failed: %v", err)
+	}
+
+	strayName := fmt.Sprintf("%06d.merge.tmp", output.id)
+
+	err = output.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	liveBefore := db.keyDirectory.Len()
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, strayName)); err != nil {
+		t.Fatalf("the fixture did not leave a stray: %v", err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+
+	if _, err := os.Stat(filepath.Join(dir, strayName)); !os.IsNotExist(err) {
+		t.Errorf("%s survived the reopen", strayName)
+	}
+
+	// and the abandoned merge changed nothing: its inputs were never deleted
+	if reopened.keyDirectory.Len() != liveBefore {
+		t.Errorf("keydir Len = %d after the reopen, want %d", reopened.keyDirectory.Len(), liveBefore)
+	}
+}
+
+// TestStrayMergeFileIsInvisibleToRecovery checks the .tmp suffix keeps a partial
+// merge out of dataFileIDs, so it cannot be replayed even before it is swept.
+func TestStrayMergeFileIsInvisibleToRecovery(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	before, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	output, _, err := db.copyLiveRecords(inputs)
+	if err != nil {
+		t.Fatalf("copyLiveRecords failed: %v", err)
+	}
+	defer output.Close()
+
+	after, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(after) != len(before) {
+		t.Errorf("dataFileIDs went from %v to %v — the scratch file is visible to recovery", before, after)
+	}
+}
