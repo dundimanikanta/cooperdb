@@ -136,3 +136,33 @@ func (db *DB) applyRelocations(relocations map[string]Entry) int {
 
 	return applied
 }
+
+// deleteAlreadyMergedFiles deltes the files that have been merged 
+
+func (db *DB) deleteAlreadyMergedFiles(inputs []uint32) error {
+
+	// the first failure, held while the rest are still attempted
+	var firstErr error
+
+	for _, id := range inputs {
+
+		// only files a read has actually opened are in the cache
+		df, ok := db.readFiles[id]
+
+		if ok {
+			err := df.Close()
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+			delete(db.readFiles, id)
+		}
+
+		err := os.Remove(filepath.Join(db.directory, fmt.Sprintf("%06d.data", id)))
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+
+	}
+
+	return firstErr
+}

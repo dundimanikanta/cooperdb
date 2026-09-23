@@ -717,3 +717,153 @@ func TestApplyRelocationsOnAnEmptyMap(t *testing.T) {
 		t.Errorf("keydir Len = %d, want 1 — an empty merge changed the keydir", db.keyDirectory.Len())
 	}
 }
+
+// TestDeleteAlreadyMergedFilesRemovesEveryInput checks a clean retire deletes all the inputs and
+// leaves the active file alone.
+func TestDeleteAlreadyMergedFilesRemovesEveryInput(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	activeID := db.dataFile.id
+
+	err := db.deleteAlreadyMergedFiles(inputs)
+	if err != nil {
+		t.Errorf("a clean retire reported: %v", err)
+	}
+
+	left, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(left) != 1 || left[0] != activeID {
+		t.Errorf("files left = %v, want just the active file %d", left, activeID)
+	}
+}
+
+// TestDeleteAlreadyMergedFilesEvictsCachedHandles checks the handles rotation left in readFiles are
+// closed and dropped, so nothing reads from a deleted file and no descriptor leaks.
+func TestDeleteAlreadyMergedFilesEvictsCachedHandles(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	if len(db.readFiles) == 0 {
+		t.Fatalf("readFiles is empty, so this test would prove nothing")
+	}
+
+	err := db.deleteAlreadyMergedFiles(inputs)
+	if err != nil {
+		t.Fatalf("deleteAlreadyMergedFiles failed: %v", err)
+	}
+
+	for _, id := range inputs {
+		if _, ok := db.readFiles[id]; ok {
+			t.Errorf("readFiles still holds a handle for retired file %d", id)
+		}
+	}
+}
+
+// TestDeleteAlreadyMergedFilesClosesEachHandleOnce guards a double close: os.File reports
+// "file already closed" the second time, which would fail an otherwise clean merge.
+func TestDeleteAlreadyMergedFilesClosesEachHandleOnce(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	cached := len(db.readFiles)
+	if cached == 0 {
+		t.Fatalf("readFiles is empty, so this test would prove nothing")
+	}
+
+	err := db.deleteAlreadyMergedFiles(inputs)
+	if err != nil {
+		t.Errorf("retiring %d cached files reported: %v", cached, err)
+	}
+}
+
+// TestDeleteAlreadyMergedFilesReportsAFailedRemove checks a remove that cannot happen is surfaced
+// rather than swallowed.
+func TestDeleteAlreadyMergedFilesReportsAFailedRemove(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	// removed behind its back, so deleteAlreadyMergedFiles' own remove has nothing to delete
+	victim := inputs[0]
+	err := os.Remove(filepath.Join(dir, fmt.Sprintf("%06d.data", victim)))
+	if err != nil {
+		t.Fatalf("removing %d failed: %v", victim, err)
+	}
+
+	if err := db.deleteAlreadyMergedFiles(inputs); err == nil {
+		t.Errorf("a failed remove was reported as success")
+	}
+}
+
+// TestDeleteAlreadyMergedFilesContinuesPastAFailure checks one bad input does not abandon the rest:
+// returning early would leave files on disk with their handles still open.
+func TestDeleteAlreadyMergedFilesContinuesPastAFailure(t *testing.T) {
+	dir := t.TempDir()
+	db, inputs := copyFixture(t, dir)
+	defer db.Close()
+
+	victim := inputs[0]
+	err := os.Remove(filepath.Join(dir, fmt.Sprintf("%06d.data", victim)))
+	if err != nil {
+		t.Fatalf("removing %d failed: %v", victim, err)
+	}
+
+	activeID := db.dataFile.id
+
+	if err := db.deleteAlreadyMergedFiles(inputs); err == nil {
+		t.Fatalf("expected an error from the missing input")
+	}
+
+	left, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(left) != 1 || left[0] != activeID {
+		t.Errorf("files left = %v, want just the active file %d — the failure stopped the loop", left, activeID)
+	}
+
+	for _, id := range inputs {
+		if _, ok := db.readFiles[id]; ok {
+			t.Errorf("readFiles still holds a handle for %d after the failure", id)
+		}
+	}
+}
+
+// TestDeleteAlreadyMergedFilesOnAnEmptyList checks retiring nothing is a no-op.
+func TestDeleteAlreadyMergedFilesOnAnEmptyList(t *testing.T) {
+	dir := t.TempDir()
+	db, _ := copyFixture(t, dir)
+	defer db.Close()
+
+	before, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	cached := len(db.readFiles)
+
+	if err := db.deleteAlreadyMergedFiles(nil); err != nil {
+		t.Errorf("retiring nothing reported: %v", err)
+	}
+
+	after, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(after) != len(before) {
+		t.Errorf("%d files before, %d after — an empty retire deleted something", len(before), len(after))
+	}
+
+	if len(db.readFiles) != cached {
+		t.Errorf("readFiles went from %d to %d handles", cached, len(db.readFiles))
+	}
+}
