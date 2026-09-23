@@ -137,8 +137,7 @@ func (db *DB) applyRelocations(relocations map[string]Entry) int {
 	return applied
 }
 
-// deleteAlreadyMergedFiles deltes the files that have been merged 
-
+// deleteAlreadyMergedFiles deltes the files that have been merged
 func (db *DB) deleteAlreadyMergedFiles(inputs []uint32) error {
 
 	// the first failure, held while the rest are still attempted
@@ -165,4 +164,40 @@ func (db *DB) deleteAlreadyMergedFiles(inputs []uint32) error {
 	}
 
 	return firstErr
+}
+
+// Merge reclaims the space held by superseded records and tombstones: every live
+// record in the sealed files is copied into one new file, and the old ones deleted.
+func (db *DB) Merge() error {
+
+	// a failed sync means what is on disk is unknown, so nothing can be trusted
+	if db.poisoned != nil {
+		return db.poisoned
+	}
+
+	mergeableFiles, err := db.mergeableFiles()
+
+	if err != nil {
+		return err
+	}
+
+	if len(mergeableFiles) == 0 {
+		return nil
+	}
+
+	mergeFile, relocations, err := db.copyLiveRecords(mergeableFiles)
+	if err != nil {
+		return err
+	}
+
+	if err := mergeFile.Sync(); err != nil {
+		mergeFile.Close()
+		os.Remove(filepath.Join(db.directory, fmt.Sprintf("%06d.data", mergeFile.id)))
+		return err
+	}
+	db.applyRelocations(relocations)
+
+	mergeFile.Close()
+
+	return db.deleteAlreadyMergedFiles(mergeableFiles)
 }

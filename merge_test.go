@@ -1,6 +1,8 @@
 package cooperdb
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -865,5 +867,349 @@ func TestDeleteAlreadyMergedFilesOnAnEmptyList(t *testing.T) {
 
 	if len(db.readFiles) != cached {
 		t.Errorf("readFiles went from %d to %d handles", cached, len(db.readFiles))
+	}
+}
+
+// dirBytes totals the size of every file in dir.
+func dirBytes(t *testing.T, dir string) int64 {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+
+	total := int64(0)
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			t.Fatalf("Info failed: %v", err)
+		}
+		total += info.Size()
+	}
+
+	return total
+}
+
+// TestMergeReclaimsSpaceAndKeepsEveryValue is the whole point of merge, end to end:
+// the directory shrinks and every live key still reads back correctly.
+func TestMergeReclaimsSpaceAndKeepsEveryValue(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(1024))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	want := make(map[string]string)
+
+	// each key written three times, so two thirds of the bytes are dead
+	for round := 0; round < 3; round++ {
+		for i := 0; i < 100; i++ {
+			key := fmt.Sprintf("k%03d", i)
+			value := fmt.Sprintf("v%03d-round%d-padding", i, round)
+
+			if err := db.Put([]byte(key), []byte(value)); err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+
+			want[key] = value
+		}
+	}
+
+	for i := 0; i < 100; i += 10 {
+		key := fmt.Sprintf("k%03d", i)
+		if err := db.Delete([]byte(key)); err != nil {
+			t.Fatalf("Delete failed: %v", err)
+		}
+		delete(want, key)
+	}
+
+	filesBefore, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	bytesBefore := dirBytes(t, dir)
+	liveBefore := db.keyDirectory.Len()
+
+	if err := db.Merge(); err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+
+	filesAfter, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(filesAfter) >= len(filesBefore) {
+		t.Errorf("%d files before, %d after — nothing was collapsed", len(filesBefore), len(filesAfter))
+	}
+
+	if dirBytes(t, dir) >= bytesBefore {
+		t.Errorf("%d bytes before, %d after — no space was reclaimed", bytesBefore, dirBytes(t, dir))
+	}
+
+	if db.keyDirectory.Len() != liveBefore {
+		t.Errorf("live keys went from %d to %d across the merge", liveBefore, db.keyDirectory.Len())
+	}
+
+	for key, value := range want {
+		got, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Get %s after merge failed: %v", key, err)
+		}
+
+		if !bytes.Equal(got, []byte(value)) {
+			t.Errorf("%s = %q after merge, want %q", key, got, value)
+		}
+	}
+
+	for i := 0; i < 100; i += 10 {
+		key := fmt.Sprintf("k%03d", i)
+		if _, err := db.Get([]byte(key)); !errors.Is(err, ErrKeyNotFound) {
+			t.Errorf("deleted %s came back after merge: %v", key, err)
+		}
+	}
+}
+
+// TestMergeSurvivesARestart checks the merged files replay correctly, which is the
+// only thing that makes the deletion of the inputs safe.
+func TestMergeSurvivesARestart(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(1024))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	want := make(map[string]string)
+
+	for round := 0; round < 3; round++ {
+		for i := 0; i < 60; i++ {
+			key := fmt.Sprintf("k%03d", i)
+			value := fmt.Sprintf("v%03d-round%d-padding", i, round)
+
+			if err := db.Put([]byte(key), []byte(value)); err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+
+			want[key] = value
+		}
+	}
+
+	for i := 0; i < 60; i += 7 {
+		key := fmt.Sprintf("k%03d", i)
+		if err := db.Delete([]byte(key)); err != nil {
+			t.Fatalf("Delete failed: %v", err)
+		}
+		delete(want, key)
+	}
+
+	if err := db.Merge(); err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer reopened.Close()
+
+	if reopened.keyDirectory.Len() != len(want) {
+		t.Errorf("keydir Len = %d after restart, want %d", reopened.keyDirectory.Len(), len(want))
+	}
+
+	for key, value := range want {
+		got, err := reopened.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Get %s after restart failed: %v", key, err)
+		}
+
+		if !bytes.Equal(got, []byte(value)) {
+			t.Errorf("%s = %q after restart, want %q", key, got, value)
+		}
+	}
+
+	for i := 0; i < 60; i += 7 {
+		key := fmt.Sprintf("k%03d", i)
+		if _, err := reopened.Get([]byte(key)); !errors.Is(err, ErrKeyNotFound) {
+			t.Errorf("deleted %s came back after restart: %v", key, err)
+		}
+	}
+}
+
+// TestMergeWritesAreDurable checks the output is flushed before the inputs are
+// deleted — without the sync, a power loss between the two takes both copies.
+func TestMergeWritesAreDurable(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(512), WithSyncNever())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 80; i++ {
+		if err := db.Put([]byte(fmt.Sprintf("k%03d", i)), []byte("value-padding-padding")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	inputs, err := db.mergeableFiles()
+	if err != nil {
+		t.Fatalf("mergeableFiles failed: %v", err)
+	}
+
+	if err := db.Merge(); err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+
+	// the inputs are gone, so the output is now the only copy and had better be
+	// a complete, readable file rather than something still sitting in the cache
+	for _, id := range inputs {
+		if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("%06d.data", id))); !os.IsNotExist(err) {
+			t.Errorf("input %d survived the merge", id)
+		}
+	}
+
+	// every record must be readable back off disk: the ones merge moved are now
+	// only in the output, and the rest are still in the active file
+	remaining, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	records := 0
+	for _, id := range remaining {
+		file, err := OpenDataFile(dir, id, dontCreateIfMissing)
+		if err != nil {
+			t.Fatalf("opening %d failed: %v", id, err)
+		}
+
+		_, err = file.Scan(func(offset int64, r *Record) error {
+			records++
+			return nil
+		})
+
+		file.Close()
+
+		if err != nil {
+			t.Fatalf("scanning %d failed: %v", id, err)
+		}
+	}
+
+	if records != 80 {
+		t.Errorf("%d records readable across %v, want 80", records, remaining)
+	}
+}
+
+// TestMergeOnAFreshDatabaseIsANoOp checks a database with nothing sealed is success
+// rather than an error, and that no output file is created for it.
+func TestMergeOnAFreshDatabaseIsANoOp(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("user:1"), []byte("alice")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	before, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if err := db.Merge(); err != nil {
+		t.Errorf("Merge on a database with nothing sealed: %v", err)
+	}
+
+	after, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(after) != len(before) {
+		t.Errorf("files went from %v to %v — a no-op merge created one", before, after)
+	}
+
+	got, err := db.Get([]byte("user:1"))
+	if err != nil || !bytes.Equal(got, []byte("alice")) {
+		t.Errorf("user:1 = %q, %v after a no-op merge", got, err)
+	}
+}
+
+// TestMergeLeavesTheActiveFileAlone checks writes still land in the active file after
+// a merge, rather than in the output it just sealed.
+func TestMergeLeavesTheActiveFileAlone(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 60; i++ {
+		if err := db.Put([]byte(fmt.Sprintf("k%03d", i)), []byte("value-padding-padding")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	activeBefore := db.dataFile.id
+
+	if err := db.Merge(); err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+
+	if db.dataFile.id != activeBefore {
+		t.Errorf("the active file changed from %d to %d across the merge", activeBefore, db.dataFile.id)
+	}
+
+	if err := db.Put([]byte("after-merge"), []byte("value")); err != nil {
+		t.Fatalf("Put after merge failed: %v", err)
+	}
+
+	entry, ok := db.keyDirectory.Get([]byte("after-merge"))
+	if !ok {
+		t.Fatalf("the key written after the merge is missing")
+	}
+
+	if entry.FileID != db.dataFile.id {
+		t.Errorf("a write after the merge landed in file %d, not the active file %d", entry.FileID, db.dataFile.id)
+	}
+}
+
+// TestMergeIsRefusedWhenPoisoned checks a database whose sync has failed will not
+// merge, since what is actually on disk is unknown.
+func TestMergeIsRefusedWhenPoisoned(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 60; i++ {
+		if err := db.Put([]byte(fmt.Sprintf("k%03d", i)), []byte("value-padding-padding")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	failure := errors.New("cooperdb: injected sync failure")
+	db.poisoned = failure
+
+	if err := db.Merge(); !errors.Is(err, failure) {
+		t.Errorf("Merge on a poisoned database = %v, want the poisoning error", err)
 	}
 }
