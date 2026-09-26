@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -79,6 +80,9 @@ type DB struct {
 	maxFileSize   int64                // the size past which the active file is sealed and the next one started
 	lastTimestamp int64                // the timestamp of the last written record
 	lastFileID    uint32               // the id of the most recently allocated data file
+
+	mu          sync.RWMutex // will be used by everyone except when we are using the readFilesMu for reading the readFiles map
+	readFilesMu sync.Mutex   // used to protect the readFiles map when adding or removing files, since it is accessed by multiple goroutines
 }
 
 // Open prepares the database in dir for use. Called with no options it syncs
@@ -235,6 +239,11 @@ func (db *DB) nextFileID() uint32 {
 
 // Put stores value under key, appending a new record and repointing the keydir.
 func (db *DB) Put(key, value []byte) error {
+
+	// adding a lock for no concurrent writes
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	// a sync has failed, so what is actually on disk is unknown
 	if db.poisoned != nil {
 		return db.poisoned
@@ -276,22 +285,8 @@ func (db *DB) Put(key, value []byte) error {
 
 // Get returns the value most recently stored under key.
 func (db *DB) Get(key []byte) ([]byte, error) {
-	// reads are refused too: serving a value would assert the database is in a
-	// known state, which after a failed sync it is not
-	if db.poisoned != nil {
-		return nil, db.poisoned
-	}
+	df, entry, err := db.locateRecord(key)
 
-	// a miss is an error, not a nil value: an empty value is a real state, so
-	// the caller could not otherwise tell "absent" from "stored but empty"
-	entry, ok := db.keyDirectory.Get(key)
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
-
-	keysFileID := entry.FileID
-
-	df, err := db.fileFor(keysFileID)
 	if err != nil {
 		return nil, err
 	}
@@ -305,6 +300,36 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return r.Value, nil
 }
 
+func (db *DB) locateRecord(key []byte) (*DataFile, Entry, error) {
+
+	// adding a read lock for concurrent reads
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	// reads are refused too: serving a value would assert the database is in a
+	// known state, which after a failed sync it is not
+	if db.poisoned != nil {
+		return nil, Entry{}, db.poisoned
+	}
+
+	// a miss is an error, not a nil value: an empty value is a real state, so
+	// the caller could not otherwise tell "absent" from "stored but empty"
+	entry, ok := db.keyDirectory.Get(key)
+	if !ok {
+		return nil, Entry{}, ErrKeyNotFound
+	}
+
+	keysFileID := entry.FileID
+
+	df, err := db.fileFor(keysFileID)
+
+	if err != nil {
+		return nil, Entry{}, err
+	}
+
+	return df, entry, err
+}
+
 // fileFor resolves the file id in a keydir entry to an open file, opening and
 // caching sealed files the first time a read reaches for one.
 func (db *DB) fileFor(keysFileID uint32) (*DataFile, error) {
@@ -315,6 +340,10 @@ func (db *DB) fileFor(keysFileID uint32) (*DataFile, error) {
 	if keysFileID == currentDataFileID {
 		return db.dataFile, nil
 	}
+
+	// adding the readFilesMu lock to disbale concurrent access
+	db.readFilesMu.Lock()
+	defer db.readFilesMu.Unlock()
 
 	df, ok := db.readFiles[keysFileID]
 
@@ -339,6 +368,11 @@ func (db *DB) fileFor(keysFileID uint32) (*DataFile, error) {
 // Close flushes the data file whatever the policy says, then closes it. No
 // poisoned check: a database that cannot be closed is one whose descriptor leaks.
 func (db *DB) Close() error {
+
+	// adding the lock when closing the db to avoid concurrent writes
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	syncErr := db.sync()
 
 	// closed even when the flush failed, or the descriptor leaks on exactly the
@@ -347,6 +381,8 @@ func (db *DB) Close() error {
 
 	// every sealed handle too, and all of them even if one fails, so a single
 	// bad handle cannot strand the rest
+
+	db.readFilesMu.Lock()
 	for id, df := range db.readFiles {
 		err := df.Close()
 		if err != nil && closeErr == nil {
@@ -355,6 +391,7 @@ func (db *DB) Close() error {
 
 		delete(db.readFiles, id)
 	}
+	db.readFilesMu.Unlock()
 
 	// the sync error wins: it means data may be lost, where a close error
 	// usually means only that the handle was already gone
@@ -368,6 +405,11 @@ func (db *DB) Close() error {
 // Delete removes key by appending a tombstone, since an append-only file cannot
 // erase. The keydir drop hides it now; the tombstone stops recovery reviving it.
 func (db *DB) Delete(key []byte) error {
+
+	// adding a lock for no concurrent writes
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	// a delete is a write, so it is refused for the same reason a Put is
 	if db.poisoned != nil {
 		return db.poisoned
@@ -406,7 +448,6 @@ func (db *DB) Delete(key []byte) error {
 // take it past the threshold. Checked before the append, so the limit is
 // respected rather than overshot.
 func (db *DB) rotateIfFull(size int) error {
-
 	currDataFile := db.dataFile
 
 	// an empty file takes the record whatever its size: one larger than the
@@ -449,8 +490,12 @@ func (db *DB) rotate() error {
 
 	// both together, and only once the successor exists: a failed open leaves
 	// the active file exactly where it was
+	// adding the readFilesMu lock to disbale concurrent access
+	db.readFilesMu.Lock()
 	db.readFiles[currID] = currDataFile
+	db.readFilesMu.Unlock()
 	db.dataFile = newDataFile
+
 	return nil
 
 }
