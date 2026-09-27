@@ -23,7 +23,8 @@ err = db.Close()
 ```
 
 - Binary record format with a CRC-32 checked on every read
-- Append-only data file; reads by absolute offset, so they take no lock
+- Append-only data file; reads by absolute offset, so the disk read itself needs
+  no lock
 - In-memory keydir mapping each live key to its newest record
 - `Put` / `Get` / `Delete`, the last writing a tombstone rather than erasing
 - A configurable flush policy, measured below
@@ -33,8 +34,10 @@ err = db.Close()
   resolve across every file
 - Compaction — `Merge` rewrites the sealed files, keeping only what is still
   live, and deletes the originals
+- Safe for concurrent use — reads run in parallel, and `Merge` runs alongside
+  reads and writes
 
-Not yet: concurrent access, and `Merge` has to be called by hand.
+Not yet: `Merge` has to be called by hand.
 
 ## File rotation
 
@@ -107,7 +110,7 @@ because file ids are allocated from a counter that never reuses one.
 
 **Merge output takes a fresh, high file id.** That inverts the usual assumption
 that a higher-numbered file holds newer data, which is exactly why replay orders
-by timestamp rather than by arrival — see Recovery above. Three things had to be
+by timestamp rather than by arrival — see Recovery below. Three things had to be
 true before this was safe: timestamps are unique and monotonic, tombstones carry
 their timestamp through replay, and `Open` starts a fresh active file instead of
 appending into whichever file has the highest id.
@@ -117,6 +120,15 @@ the whole crash-safety story. Delete first and a power loss takes both copies at
 once — the new file still sitting in the page cache, the old ones already gone.
 If the flush fails, the output is discarded and the inputs are left untouched, so
 a failed merge costs nothing and can simply be retried.
+
+**A crash mid-merge leaves nothing to clean up by hand.** The output is written
+under a temporary name, `NNNNNN.merge.tmp`, and renamed to `.data` only once it
+has been flushed. A rename is atomic, so after a crash the output is either
+missing, complete, or still carrying its temporary name — and `Open` deletes any
+`.merge.tmp` it finds. A crash *after* the rename but before the originals are
+deleted leaves two copies of some records, which is harmless: the copies carry
+their original timestamps, so replay resolves them correctly, and the next merge
+folds them together.
 
 ### Known limits
 
@@ -133,10 +145,118 @@ Fine while `Merge` is called deliberately; it would be wasteful on a timer.
 **Output is a single file**, ignoring the rotation threshold, so a large database
 merges into one oversized file.
 
-**A crash mid-merge leaves the partial output behind.** Harmless — its records
-are copies carrying their original timestamps, so they can never beat a later
-write, and the next merge folds the file in and deletes it. But nothing sweeps it
-before then.
+## Concurrency
+
+A `*DB` is safe to share between goroutines. There is no need to wrap it in your
+own mutex.
+
+### What runs at the same time
+
+| these two | at the same time? |
+|---|---|
+| `Get` + `Get` | **yes**, fully in parallel |
+| `Get` + `Put` / `Delete` | **they take turns** — a read waits for a write in progress |
+| `Put` / `Delete` + `Put` / `Delete` | **no** — writes go one at a time |
+| `Merge` + `Get` | **yes** |
+| `Merge` + `Put` / `Delete` | **yes** |
+| `Merge` + `Merge` | **no** — the second returns `ErrMergeInProgress` |
+
+**Reads run in parallel.** Any number of `Get` calls can be in progress at once.
+Each one looks up the key under a shared lock, then reads the value from disk
+with no lock held at all.
+
+**Writes run one at a time, and a read waits for a write in progress.** A `Put`
+or `Delete` holds an exclusive lock for its whole duration — the append to the
+file *and* the flush your sync policy asks for. Under `SyncNever` that is a few
+microseconds; under `SyncAlways` it is a full `fsync`, and reads arriving in that
+window wait for it.
+
+**Writes cannot be starved by reads.** Once a write is waiting, Go's
+`sync.RWMutex` stops letting new reads in ahead of it. A constant stream of reads
+therefore never locks out writes — at the cost that reads briefly queue behind a
+waiting write.
+
+**`Merge` runs alongside both.** It copies records without holding the lock, so
+reads and writes carry on throughout. They are only held up for the final step,
+when the in-memory index is repointed at the new file — a memory-only operation
+with no disk I/O.
+
+**A read does not fail because a merge deleted its file.** If a merge removes
+the file a read was about to use, the read looks the key up again — up to three
+attempts — and finds the merged copy. This works because a merge always updates
+the index *before* it deletes anything, so the second lookup already points at
+the new file.
+
+### One merge at a time
+
+Only one `Merge` runs at once. A second call made while one is running returns
+`ErrMergeInProgress` straight away and does nothing:
+
+```go
+err := db.Merge()
+if errors.Is(err, cooperdb.ErrMergeInProgress) {
+	// another merge is already running; nothing to do
+}
+```
+
+It returns rather than waiting on purpose. By the time the first merge finishes,
+the files are already compacted, so a second pass would rewrite everything for no
+gain.
+
+### Closing
+
+Stop every goroutine that uses the database, *then* call `Close`:
+
+```go
+var wg sync.WaitGroup
+// ... goroutines that use db, each calling wg.Done() when finished
+wg.Wait()
+
+err := db.Close()
+```
+
+What `Close` guarantees:
+
+- **It waits for a running `Merge` to finish**, so nothing is written to or
+  deleted from the directory after `Close` returns.
+- **It waits for a write in progress**, and flushes it.
+- **A read already in progress** either completes normally or returns
+  `ErrDatabaseClosed` — never a partial value.
+- **Every call after `Close` returns `ErrDatabaseClosed`**, including `Get`. No
+  file is reopened after shutdown.
+- **Calling `Close` twice is safe.** The second call returns `nil`.
+
+`Close` does **not** wait for goroutines that have not yet made their call. That
+part is the caller's job, which is why the `WaitGroup` comes first.
+
+If the database has already failed — a flush returned an error, see Durability —
+`Close` still releases every file but does not flush again, and returns that
+original error. Errors from later calls match both:
+
+```go
+errors.Is(err, cooperdb.ErrDatabaseClosed) // true
+errors.Is(err, originalFlushError)         // also true
+```
+
+### Errors
+
+| error | returned by | meaning |
+|---|---|---|
+| `ErrMergeInProgress` | `Merge` | another merge is already running; this call did nothing |
+| `ErrDatabaseClosed` | every call after `Close` | the database has been closed |
+
+### How this is tested
+
+The concurrency tests run readers, writers and merges at the same time under
+Go's race detector:
+
+```sh
+go test -race ./...
+```
+
+Each lock was also removed one at a time to confirm that a test fails without
+it. A race-detector run only reports races it actually observes, so a passing
+suite on its own does not prove the locks are needed.
 
 ## Recovery
 
@@ -293,5 +413,8 @@ Read these as a comparison between policies rather than as absolute throughput:
 ## Testing
 
 ```sh
-go test ./...
+go test -race ./...
 ```
+
+`-race` matters here: the concurrency tests only prove anything under the race
+detector.
