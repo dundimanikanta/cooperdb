@@ -16,5 +16,8 @@ coverage.out
 # Personal study notes, not part of the engine
 /notes.md
 
+/notes_shorted.md
+
+/structure.md
 # macOS
 .DS_Store
