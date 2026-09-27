@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -81,8 +82,12 @@ type DB struct {
 	lastTimestamp int64                // the timestamp of the last written record
 	lastFileID    uint32               // the id of the most recently allocated data file
 
+	// mu guards every field above except readFiles, which readFilesMu guards, and
+	// mu is always taken first. Merge inverts this: it holds neither, its helpers do.
 	mu          sync.RWMutex // will be used by everyone except when we are using the readFilesMu for reading the readFiles map
 	readFilesMu sync.Mutex   // used to protect the readFiles map when adding or removing files, since it is accessed by multiple goroutines
+
+	readRetries atomic.Int64 // reads that had to look the key up again because merge closed the file under them
 }
 
 // Open prepares the database in dir for use. Called with no options it syncs
@@ -285,19 +290,39 @@ func (db *DB) Put(key, value []byte) error {
 
 // Get returns the value most recently stored under key.
 func (db *DB) Get(key []byte) ([]byte, error) {
-	df, entry, err := db.locateRecord(key)
 
-	if err != nil {
-		return nil, err
+	const maxRetries = 3
+
+	var lastErr error
+
+	for retry := 0; retry < maxRetries; retry++ {
+
+		df, entry, err := db.locateRecord(key)
+
+		if err != nil {
+			return nil, err
+		}
+
+		// the offset and size the keydir recorded when this record was written
+		r, err := df.ReadAt(entry.Offset, entry.Size)
+
+		if err == nil {
+			return r.Value, nil
+		}
+
+		// wrapped in an *os.PathError, so errors.Is rather than ==
+		if !errors.Is(err, os.ErrClosed) && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+
+		db.readRetries.Add(1)
+
+		lastErr = err
+
 	}
 
-	// the offset and size the keydir recorded when this record was written
-	r, err := df.ReadAt(entry.Offset, entry.Size)
-	if err != nil {
-		return nil, err
-	}
+	return nil, lastErr
 
-	return r.Value, nil
 }
 
 func (db *DB) locateRecord(key []byte) (*DataFile, Entry, error) {

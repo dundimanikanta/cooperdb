@@ -2,7 +2,9 @@ package cooperdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 )
@@ -263,4 +265,191 @@ func TestConcurrentColdCacheMisses(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestConcurrentMergeWithReads is the hard case the merge design calls out: a
+// read arriving for a record in a file merge is about to delete.
+func TestConcurrentMergeWithReads(t *testing.T) {
+	const keys = 200
+	const rounds = 4
+
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	// rounds over the same keys, so the sealed files hold superseded records
+	for round := 0; round < rounds; round++ {
+		for i := 0; i < keys; i++ {
+			value := []byte(fmt.Sprintf("value-r%d-padding", round))
+			if err := db.Put(concurrencyKey(i), value); err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+		}
+	}
+
+	before, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(before) < 10 {
+		t.Fatalf("only %d files; the fixture gives merge too little to do", len(before))
+	}
+
+	var wg sync.WaitGroup
+
+	// closed when the merges are done, so the readers and writers below run for
+	// the whole merge rather than finishing in its first millisecond
+	done := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(done)
+
+		for m := 0; m < 8; m++ {
+			if err := db.Merge(); err != nil {
+				t.Errorf("Merge failed: %v", err)
+				return
+			}
+		}
+	}()
+
+	// no key is ever deleted, so ErrKeyNotFound is never a legal answer here
+	for r := 0; r < 6; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+
+			for i := 0; ; i++ {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				key := concurrencyKey((r*31 + i) % keys)
+
+				value, err := db.Get(key)
+				if err != nil {
+					t.Errorf("Get(%s) failed: %v", key, err)
+					return
+				}
+
+				if !bytes.HasPrefix(value, []byte("value-")) {
+					t.Errorf("read a malformed value: %q", value)
+					return
+				}
+			}
+		}(r)
+	}
+
+	// a disjoint key range, so the fixture's keys stay live and merge has real
+	// records to relocate. Writing the same keys supersedes every one of them,
+	// isLive then rejects the lot, and the merges become no-ops.
+	//
+	// Capped as well as signalled: unbounded writers would bury merge in files.
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+
+			for i := 0; i < keys*25; i++ {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				value := []byte(fmt.Sprintf("value-w%d-padding", w))
+				if err := db.Put(concurrencyKey(keys+i%keys), value); err != nil {
+					t.Errorf("Put failed: %v", err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+
+	// the fixture's keys plus the writers' disjoint range
+	if db.keyDirectory.Len() != keys*2 {
+		t.Errorf("keydir Len = %d, want %d", db.keyDirectory.Len(), keys*2)
+	}
+
+	for i := 0; i < keys*2; i++ {
+		if _, err := db.Get(concurrencyKey(i)); err != nil {
+			t.Errorf("Get(%s) failed after the merges: %v", concurrencyKey(i), err)
+		}
+	}
+
+	// once the writers have stopped, so the count is not a moving target
+	if err := db.Merge(); err != nil {
+		t.Fatalf("final Merge failed: %v", err)
+	}
+
+	after, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(after) >= len(before) {
+		t.Errorf("files went %d -> %d; the merges reclaimed nothing", len(before), len(after))
+	}
+
+	t.Logf("files %d -> %d, read retries %d", len(before), len(after), db.readRetries.Load())
+}
+
+// TestGetRetriesOnAClosedFile drives the retry branch directly, because the
+// concurrent test above never opens the window it exists for.
+func TestGetRetriesOnAClosedFile(t *testing.T) {
+	const keys = 100
+
+	db, err := Open(t.TempDir(), WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < keys; i++ {
+		if err := db.Put(concurrencyKey(i), []byte("value-original-padding")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	// key 0 is in the first sealed file, so reading it caches that handle
+	if _, err := db.Get(concurrencyKey(0)); err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	entry, ok := db.keyDirectory.Get(concurrencyKey(0))
+	if !ok {
+		t.Fatal("key 0 is not in the keydir")
+	}
+
+	cached, ok := db.readFiles[entry.FileID]
+	if !ok {
+		t.Fatalf("file %d is not cached, so the fixture read the active file", entry.FileID)
+	}
+
+	// what deleteAlreadyMergedFiles does, minus the eviction: every attempt then
+	// finds the same closed handle, so the retries run out instead of succeeding
+	if err := cached.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	before := db.readRetries.Load()
+
+	_, err = db.Get(concurrencyKey(0))
+	if !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("Get error = %v, want one wrapping os.ErrClosed", err)
+	}
+
+	if got := db.readRetries.Load() - before; got != 3 {
+		t.Errorf("readRetries rose by %d, want 3", got)
+	}
 }

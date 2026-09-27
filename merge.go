@@ -15,9 +15,11 @@ func (db *DB) mergeableFiles() ([]uint32, error) {
 		return nil, err
 	}
 
-	// filter out the active file id from the list of mergeable files
+	db.mu.RLock()
 	activeFileID := db.dataFile.id
+	db.mu.RUnlock()
 
+	// filter out the active file id from the list of mergeable files
 	for i, id := range ids {
 		if id == activeFileID {
 			ids = append(ids[:i], ids[i+1:]...)
@@ -30,6 +32,10 @@ func (db *DB) mergeableFiles() ([]uint32, error) {
 // isLive reports whether the record at fileID/offset is the version the keydir
 // currently serves for its key. Superseded and deleted records answer false.
 func (db *DB) isLive(fileID uint32, offset int64, r *Record) bool {
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
 	e, ok := db.keyDirectory.Get(r.Key)
 	if !ok {
 		return false
@@ -56,7 +62,12 @@ func (db *DB) copyLiveRecords(inputs []uint32) (*DataFile, map[string]Entry, err
 
 	relocations := make(map[string]Entry)
 
-	output, err := OpenMergeFile(db.directory, db.nextFileID(), createIfMissing)
+	db.mu.Lock()
+	id := db.nextFileID()
+	db.mu.Unlock()
+
+	output, err := OpenMergeFile(db.directory, id, createIfMissing)
+
 	if err != nil {
 		return nil, nil, err
 	}
@@ -155,7 +166,9 @@ func (db *DB) applyRelocations(relocations map[string]Entry) int {
 	// how many were actually repointed
 	applied := 0
 
-	// iterating over the the relocations map
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	for key, moved := range relocations {
 
 		current, ok := db.keyDirectory.Get([]byte(key))
@@ -178,6 +191,9 @@ func (db *DB) deleteAlreadyMergedFiles(inputs []uint32) error {
 
 	// the first failure, held while the rest are still attempted
 	var firstErr error
+
+	db.readFilesMu.Lock()
+	defer db.readFilesMu.Unlock()
 
 	for _, id := range inputs {
 
@@ -207,8 +223,12 @@ func (db *DB) deleteAlreadyMergedFiles(inputs []uint32) error {
 func (db *DB) Merge() error {
 
 	// a failed sync means what is on disk is unknown, so nothing can be trusted
-	if db.poisoned != nil {
-		return db.poisoned
+	db.mu.RLock()
+	poisoned := db.poisoned
+	db.mu.RUnlock()
+
+	if poisoned != nil {
+		return poisoned
 	}
 
 	mergeableFiles, err := db.mergeableFiles()
