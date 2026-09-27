@@ -1214,6 +1214,38 @@ func TestMergeIsRefusedWhenPoisoned(t *testing.T) {
 	}
 }
 
+// TestMergeIsRefusedWhileAnotherIsRunning holds mergeMu directly, so the guard is
+// tested without depending on two goroutines overlapping.
+func TestMergeIsRefusedWhileAnotherIsRunning(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 60; i++ {
+		if err := db.Put([]byte(fmt.Sprintf("k%03d", i)), []byte("value-padding-padding")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	db.mergeMu.Lock()
+
+	if err := db.Merge(); !errors.Is(err, ErrMergeInProgress) {
+		db.mergeMu.Unlock()
+		t.Fatalf("Merge during a merge = %v, want ErrMergeInProgress", err)
+	}
+
+	db.mergeMu.Unlock()
+
+	// the guard releases, so the next caller is not refused for good
+	if err := db.Merge(); err != nil {
+		t.Errorf("Merge after the first finished = %v, want nil", err)
+	}
+}
+
 // TestOpenSweepsStrayMergeFiles checks a merge that never committed leaves nothing
 // behind after the next restart.
 func TestOpenSweepsStrayMergeFiles(t *testing.T) {

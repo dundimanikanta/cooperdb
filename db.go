@@ -13,6 +13,10 @@ import (
 // ErrKeyNotFound is returned by Get for a key the keydir has no entry for.
 var ErrKeyNotFound = errors.New("cooperdb: key not found")
 
+var ErrMergeInProgress = errors.New("cooperdb: a merge is already running")
+
+var ErrDatabaseClosed = errors.New("cooperdb: database is closed")
+
 type SyncPolicy int
 
 const (
@@ -76,7 +80,7 @@ type DB struct {
 	syncPolicy    SyncPolicy           // when to flush; the zero value is SyncNever
 	syncEveryN    int                  // the flush interval, only meaningful under SyncEveryN
 	writeCount    int                  // writes since the last flush, only used under SyncEveryN
-	poisoned      error                // set once a sync fails, and never cleared
+	poisoned      error                // set once a sync fails or Close runs, and never cleared
 	readFiles     map[uint32]*DataFile // open handles for reading old files, keyed by id
 	maxFileSize   int64                // the size past which the active file is sealed and the next one started
 	lastTimestamp int64                // the timestamp of the last written record
@@ -86,6 +90,7 @@ type DB struct {
 	// mu is always taken first. Merge inverts this: it holds neither, its helpers do.
 	mu          sync.RWMutex // will be used by everyone except when we are using the readFilesMu for reading the readFiles map
 	readFilesMu sync.Mutex   // used to protect the readFiles map when adding or removing files, since it is accessed by multiple goroutines
+	mergeMu     sync.Mutex
 
 	readRetries atomic.Int64 // reads that had to look the key up again because merge closed the file under them
 }
@@ -390,15 +395,25 @@ func (db *DB) fileFor(keysFileID uint32) (*DataFile, error) {
 
 }
 
-// Close flushes the data file whatever the policy says, then closes it. No
-// poisoned check: a database that cannot be closed is one whose descriptor leaks.
+// Close flushes the data file whatever the policy says, then closes it. A poisoned
+// database is closed without syncing again, and reports the original failure.
 func (db *DB) Close() error {
+
+	db.mergeMu.Lock()
+	defer db.mergeMu.Unlock()
 
 	// adding the lock when closing the db to avoid concurrent writes
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	syncErr := db.sync()
+	if errors.Is(db.poisoned, ErrDatabaseClosed) {
+		return nil
+	}
+
+	syncErr := db.poisoned
+	if syncErr == nil {
+		syncErr = db.sync()
+	}
 
 	// closed even when the flush failed, or the descriptor leaks on exactly the
 	// path where something has already gone wrong
@@ -417,6 +432,8 @@ func (db *DB) Close() error {
 		delete(db.readFiles, id)
 	}
 	db.readFilesMu.Unlock()
+
+	db.poisoned = errors.Join(ErrDatabaseClosed, db.poisoned)
 
 	// the sync error wins: it means data may be lost, where a close error
 	// usually means only that the handle was already gone

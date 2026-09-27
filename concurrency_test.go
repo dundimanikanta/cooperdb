@@ -453,3 +453,95 @@ func TestGetRetriesOnAClosedFile(t *testing.T) {
 		t.Errorf("readRetries rose by %d, want 3", got)
 	}
 }
+
+// TestConcurrentMergesLeaveNoOrphan is the regression guard for a measured bug: two
+// merges at once each wrote an output, and only one of them was ever deleted.
+//
+// The timestamp CAS cannot catch it. Both merges copy the same live records, so both
+// carry identical timestamps and the second repoint passes the comparison.
+func TestConcurrentMergesLeaveNoOrphan(t *testing.T) {
+	const keys = 150
+	const rounds = 3
+
+	dir := t.TempDir()
+
+	db, err := Open(dir, WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	for round := 0; round < rounds; round++ {
+		for i := 0; i < keys; i++ {
+			if err := db.Put(concurrencyKey(i), []byte("value-original-padding")); err != nil {
+				t.Fatalf("Put failed: %v", err)
+			}
+		}
+	}
+
+	before, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(before) < 10 {
+		t.Fatalf("only %d files; the fixture gives merge too little to do", len(before))
+	}
+
+	var wg sync.WaitGroup
+
+	// a barrier, so both goroutines are inside Merge at the same moment rather than
+	// one finishing before the other starts
+	start := make(chan struct{})
+	errs := make([]error, 2)
+
+	for m := 0; m < 2; m++ {
+		wg.Add(1)
+		go func(m int) {
+			defer wg.Done()
+			<-start
+			errs[m] = db.Merge()
+		}(m)
+	}
+
+	close(start)
+	wg.Wait()
+
+	merged := 0
+	refused := 0
+
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			merged++
+		case errors.Is(err, ErrMergeInProgress):
+			refused++
+		default:
+			t.Errorf("Merge returned an unexpected error: %v", err)
+		}
+	}
+
+	if merged != 1 || refused != 1 {
+		t.Errorf("%d merged and %d refused, want exactly 1 of each: %v", merged, refused, errs)
+	}
+
+	// the merged output plus the active file, and nothing orphaned between them
+	after, err := dataFileIDs(dir)
+	if err != nil {
+		t.Fatalf("dataFileIDs failed: %v", err)
+	}
+
+	if len(after) != 2 {
+		t.Errorf("files went %d -> %d, want 2; a second output was left behind", len(before), len(after))
+	}
+
+	if db.keyDirectory.Len() != keys {
+		t.Errorf("keydir Len = %d, want %d", db.keyDirectory.Len(), keys)
+	}
+
+	for i := 0; i < keys; i++ {
+		if _, err := db.Get(concurrencyKey(i)); err != nil {
+			t.Errorf("Get(%s) failed: %v", concurrencyKey(i), err)
+		}
+	}
+}

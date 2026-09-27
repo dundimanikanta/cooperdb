@@ -610,14 +610,167 @@ func TestDBCloseOnPoisonedDB(t *testing.T) {
 		t.Fatalf("closing the data file failed: %v", err)
 	}
 
-	if db.sync() == nil {
+	syncErr := db.sync()
+	if syncErr == nil {
 		t.Fatalf("sync on a closed file returned nil, want an error")
 	}
 
 	// Close still runs, and reports the sync failure rather than swallowing it
 	err = db.Close()
-	if err == nil {
-		t.Errorf("Close on a poisoned DB returned nil, want the sync error")
+	if !errors.Is(err, syncErr) {
+		t.Errorf("Close on a poisoned DB = %v, want the original sync error %v", err, syncErr)
+	}
+}
+
+// TestDBCloseDoesNotSyncAgainWhenPoisoned poisons a healthy file, so a second fsync would succeed and hide the first failure.
+func TestDBCloseDoesNotSyncAgainWhenPoisoned(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if err := db.Put([]byte("user:1"), []byte("alice")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	injected := errors.New("cooperdb: injected sync failure")
+	db.poisoned = injected
+
+	if err := db.Close(); !errors.Is(err, injected) {
+		t.Errorf("Close on a poisoned DB = %v, want the original failure %v", err, injected)
+	}
+}
+
+// TestDBOperationsAfterCloseAreRefused checks every call is turned away and no file handle is reopened after shutdown.
+func TestDBOperationsAfterCloseAreRefused(t *testing.T) {
+	db, err := Open(t.TempDir(), WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	const count = 100
+
+	for i := 0; i < count; i++ {
+		if err := db.Put([]byte(fmt.Sprintf("k%03d", i)), []byte("value-padding-padding")); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+	}
+
+	sealed := []byte("k000")
+	active := []byte(fmt.Sprintf("k%03d", count-1))
+
+	sealedEntry, _ := db.keyDirectory.Get(sealed)
+	activeEntry, _ := db.keyDirectory.Get(active)
+
+	if sealedEntry.FileID == db.dataFile.id || activeEntry.FileID != db.dataFile.id {
+		t.Fatalf("fixture did not put one key in a sealed file and one in the active file")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	if _, err := db.Get(sealed); !errors.Is(err, ErrDatabaseClosed) {
+		t.Errorf("Get on a sealed key after Close = %v, want ErrDatabaseClosed", err)
+	}
+
+	if _, err := db.Get(active); !errors.Is(err, ErrDatabaseClosed) {
+		t.Errorf("Get on an active key after Close = %v, want ErrDatabaseClosed", err)
+	}
+
+	if err := db.Put([]byte("new"), []byte("value")); !errors.Is(err, ErrDatabaseClosed) {
+		t.Errorf("Put after Close = %v, want ErrDatabaseClosed", err)
+	}
+
+	if err := db.Delete(sealed); !errors.Is(err, ErrDatabaseClosed) {
+		t.Errorf("Delete after Close = %v, want ErrDatabaseClosed", err)
+	}
+
+	if err := db.Merge(); !errors.Is(err, ErrDatabaseClosed) {
+		t.Errorf("Merge after Close = %v, want ErrDatabaseClosed", err)
+	}
+
+	if len(db.readFiles) != 0 {
+		t.Errorf("readFiles holds %d handles after Close; a read reopened a file nothing will close", len(db.readFiles))
+	}
+}
+
+// TestDBCloseTwiceIsANoOp checks a second Close returns nil rather than closing closed files again.
+func TestDBCloseTwiceIsANoOp(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if err := db.Put([]byte("user:1"), []byte("alice")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("first Close failed: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Errorf("second Close = %v, want nil", err)
+	}
+}
+
+// TestDBClosedAfterPoisonedKeepsBothErrors checks closing does not overwrite the sync failure that came first.
+func TestDBClosedAfterPoisonedKeepsBothErrors(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if err := db.Put([]byte("user:1"), []byte("alice")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	injected := errors.New("cooperdb: injected sync failure")
+	db.poisoned = injected
+
+	db.Close()
+
+	_, err = db.Get([]byte("user:1"))
+
+	if !errors.Is(err, ErrDatabaseClosed) {
+		t.Errorf("Get after Close = %v, want it to wrap ErrDatabaseClosed", err)
+	}
+
+	if !errors.Is(err, injected) {
+		t.Errorf("Get after Close = %v, want it to still wrap the original sync failure", err)
+	}
+}
+
+// TestDBCloseWaitsForARunningMerge holds mergeMu the way a running merge does, and checks Close cannot return until it is released.
+func TestDBCloseWaitsForARunningMerge(t *testing.T) {
+	db, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if err := db.Put([]byte("user:1"), []byte("alice")); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	db.mergeMu.Lock()
+
+	closed := make(chan error, 1)
+	go func() {
+		closed <- db.Close()
+	}()
+
+	select {
+	case err := <-closed:
+		db.mergeMu.Unlock()
+		t.Fatalf("Close returned %v while a merge was still running", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	db.mergeMu.Unlock()
+
+	if err := <-closed; err != nil {
+		t.Errorf("Close after the merge finished = %v, want nil", err)
 	}
 }
 

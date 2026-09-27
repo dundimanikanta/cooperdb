@@ -222,6 +222,11 @@ func (db *DB) deleteAlreadyMergedFiles(inputs []uint32) error {
 // record in the sealed files is copied into one new file, and the old ones deleted.
 func (db *DB) Merge() error {
 
+	if !db.mergeMu.TryLock() {
+		return ErrMergeInProgress
+	}
+	defer db.mergeMu.Unlock()
+
 	// a failed sync means what is on disk is unknown, so nothing can be trusted
 	db.mu.RLock()
 	poisoned := db.poisoned
