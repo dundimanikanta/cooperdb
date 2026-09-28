@@ -36,6 +36,8 @@ err = db.Close()
   live, and deletes the originals
 - Safe for concurrent use — reads run in parallel, and `Merge` runs alongside
   reads and writes
+- Crash-tested — 300 consecutive `SIGKILL`s, including 89 in the middle of a
+  merge, with zero acknowledged writes lost
 
 Not yet: `Merge` has to be called by hand.
 
@@ -330,6 +332,122 @@ validated, and this format has no support for that. Bitcask has the same limit.
 In practice this needs damage cooperdb did not cause, since both the crash case
 and the failed-write case are truncated away before anything is written past
 them.
+
+## Crash testing
+
+Recovery is only proven by crashing something. The crash test starts a second
+process that writes, deletes and merges as fast as it can, kills it with
+`SIGKILL` at a random moment, reopens the database, and checks every operation
+the killed process was promised. Then it starts another process on **the same
+directory** and does it again.
+
+```sh
+go test -race -run TestAcknowledgedWritesSurviveRepeatedKills -v ./...    # 20 kills
+
+COOPERDB_CRASH_RUNS=300 \
+  go test -race -run TestAcknowledgedWritesSurviveRepeatedKills -v ./...  # 300 kills
+```
+
+`SIGKILL` is the hardest kill there is: no `Close`, no deferred code, no chance
+to clean up. It runs as part of `go test ./...` and is skipped under `-short`.
+
+### How it knows what is correct
+
+The child process announces every operation twice. It prints `intent` just
+before calling `Put` or `Delete`, and `ack` only after the call returns nil:
+
+```
+CRASH intent put key17 key17@g5s4521
+CRASH ack    put key17 key17@g5s4521
+```
+
+An `ack` is a promise: that operation succeeded and must survive. Everything the
+child printed is still in the pipe after it dies, so the parent sees every
+promise made before the kill.
+
+The child performs one operation at a time, so when it is killed **at most one
+operation is in flight**: the last `intent` with no `ack`. That gives every key
+exactly two correct states after the reopen: what the last acknowledged
+operation left, or what the interrupted one would have left. Anything else
+fails the test — a lost write, a deleted key coming back, a value nobody wrote.
+The test also counts every key in the database, so a key appearing from nowhere
+fails it too.
+
+The interrupted operation really does land without its `ack` sometimes, because
+the kill can arrive between `Put` returning and the line being printed. A test
+that expected only the acknowledged state would fail a correct database.
+
+### Why the same directory, and why merges
+
+**Repeated kills on one directory**, because some bugs only show up a restart
+*after* the crash that caused them. Each child starts on whatever the previous
+crash left behind, and each check covers everything written since the first
+one, not only the last run. Every value carries its generation number
+(`key17@g5s4521`), so a value left over from an earlier run can never pass for
+a newer one.
+
+**Merges**, because they are the only thing that copies old records into a
+newer file — which is exactly where the dangerous recovery bugs live. A
+tombstone replayed before an older, relocated copy of its key is how a deleted
+key comes back. Without merges, older records always sit in older files, so even
+broken recovery code gets the right answer. The child uses 1 KB files so
+rotation and merging happen constantly, and one generation in three merges
+every 20 operations. Merging in every generation would put nearly every kill
+inside a merge, because a merge takes far longer than a write.
+
+### Results
+
+300 consecutive kills on one directory, under the race detector:
+
+| | |
+|---|---:|
+| acknowledged operations verified | 28,366 |
+| merges completed | 36 |
+| kills that landed mid-merge | 89 |
+| abandoned `.merge.tmp` files swept by `Open` | 82 |
+| half-written records found | 0 |
+| acknowledged operations lost | **0** |
+
+Where the interrupted operation stood at each kill:
+
+| did not land | landed without its `ack` | no visible change | nothing in flight |
+|---:|---:|---:|---:|
+| 197 | 6 | 2 | 95 |
+
+"Did not land" dominates because each file fills after about 25 writes and
+sealing it forces an `fsync`, which takes milliseconds. Most kills arrive during
+that flush, and the size check runs *before* a record is appended, so the
+interrupted write has not reached the file yet.
+
+### Proof it can fail
+
+A test that has never failed has not been shown to catch anything, so three
+real recovery bugs were planted, one at a time:
+
+| planted bug | first failure |
+|---|---|
+| replay ignores timestamps | `gen 3: key18 = "<absent>", want "key18@g3s25"` |
+| replay forgets a tombstone's timestamp | `gen 12: key28 = "key28@g9s57", want "<absent>"` |
+| merge deletes its inputs before renaming its output | `gen 9: key53 = "<absent>", want "key53@g9s26"` |
+
+The second is the deleted-key bug described under Recovery. Here it surfaced
+**three crashes after the value was written**: `key28` was written in
+generation 9, deleted later, and came back in generation 12. An earlier version
+of this test, with a fresh directory per kill and no merges, passed **50 runs
+out of 50** with that same bug in place. Repeated kills and merges are what make
+it visible.
+
+### What it does not prove
+
+- **Power loss.** `SIGKILL` kills the process, not the machine. Anything `write`
+  handed to the kernel stays in its page cache and still reaches the disk, so all
+  three sync policies behave identically here. Testing power loss needs a VM
+  that can be hard-reset, or block-level fault injection. See Durability.
+- **Torn records.** None of the 300 kills produced one. Each record is written
+  with a single `write` call, and a kill cannot split a write to a regular file.
+  The torn-tail recovery described above is covered by separate tests that
+  damage the file directly: one cuts the last record short, another appends a
+  partial record after it.
 
 ## Record format
 
