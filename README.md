@@ -363,14 +363,16 @@ db, err := cooperdb.Open("./data", WithSyncEveryN(100))
 db, err := cooperdb.Open("./data", WithSyncAlways())
 ```
 
+One writer:
+
 | policy | ops/sec | ns/op | a power loss can take |
 |---|---:|---:|---|
-| `SyncNever` | ~521,000 | 1,920 | writes since the last file seal that the kernel has not written back yet |
-| `SyncEveryN(100)` | ~26,200 | 38,184 | at most the last 100 writes |
-| `SyncAlways` | ~261 | 3,831,932 | nothing that has returned |
-| `Get` (policy has no effect) | ~1,261,000 | 793 | — |
+| `SyncNever` | ~666,000 | 1,501 | writes since the last file seal that the kernel has not written back yet |
+| `SyncEveryN(100)` | ~26,200 | 38,165 | at most the last 100 writes |
+| `SyncAlways` | ~268 | 3,729,104 | nothing that has returned |
+| `Get` (policy has no effect) | ~2,650,000 | 378 | — |
 
-Durability costs about **2,000×** on this hardware.
+Durability costs about **2,500×** on this hardware.
 
 **Every row above describes power loss or a kernel panic.** Under a *process*
 crash — a panic, a `SIGKILL` — all three policies lose nothing that `Write`
@@ -384,31 +386,90 @@ treating the pages as clean, so a second call would report success over data
 that is already gone. The database is marked failed instead and refuses all
 further operations, reads included.
 
+### Concurrent writers
+
+The table above uses a single goroutine, so nothing ever waits for the lock.
+With several goroutines writing at once, every `Put` takes its turn at the
+write lock, and the picture changes in ways a single writer cannot show. The
+latencies below are per `Put`, **time spent waiting for the lock included**.
+
+`SyncAlways`:
+
+| writers | writes/sec | p50 | p99 |
+|---:|---:|---:|---:|
+| 1 | 268 | 3.97 ms | 5.12 ms |
+| 10 | 261 | 39.0 ms | 42.0 ms |
+| 100 | 279 | 359 ms | 406 ms |
+
+`SyncNever`:
+
+| writers | writes/sec | p50 | p99 |
+|---:|---:|---:|---:|
+| 1 | 729,824 | 1.38 µs | 2.58 µs |
+| 10 | 484,742 | 1.58 µs | 348.5 µs |
+| 100 | 482,431 | 1.67 µs | 1,997 µs |
+
+**When every write is synced, adding writers adds no throughput.** `Put` holds
+the write lock across the `fsync`, so writes go through one at a time at about
+3.7 ms each: roughly 270 a second in total, however many goroutines are
+writing. Each extra writer only makes the queue longer. With 100 writers, a
+write waits about 0.4 s. Databases avoid this with *group commit*, where a
+single flush makes every waiting writer's record durable at once. cooperdb does
+not do that yet.
+
+**Without syncing, contention costs a third of the throughput and shows up in
+the tail.** Going from one writer to ten drops throughput from ~730K to ~485K
+writes/sec, and it then holds flat up to 100. The typical write barely changes
+(1.4 → 1.7 µs), but the slowest 1% becomes about **770× slower** (2.6 µs → 2.0
+ms). An average would hide that entirely.
+
+**Uncontended, the locks cost very little.** Measured against the code from
+just before they were added, back to back on the same machine, a lone `Put` is
+6.8% slower and a `Get` 2% slower. An uncontended lock and unlock on its own
+costs about 6 ns.
+
 ### How these were measured
 
 ```sh
-go test -bench=. -benchtime=10000x -run='^$' ./...
+# one writer: fixed count for the fsync-bound rows, 2-second runs for the fast ones
+go test -bench='PutSyncEveryN|PutSyncAlways' -benchtime=10000x -count=5 -run='^$' ./...
+go test -bench='PutSyncNever|BenchmarkGet'   -benchtime=2s     -count=6 -run='^$' ./...
+
+# concurrent writers
+go test -bench='PutWriters/SyncAlways' -benchtime=33000x         -run='^$' ./...
+go test -bench='PutWriters/SyncNever'  -benchtime=2s    -count=5 -run='^$' ./...
 ```
 
-- Apple M5, 10 cores, macOS 26.6.2, Go 1.26.6, darwin/arm64
+- Apple M5 MacBook Air (10 cores, no fan), macOS 26.6.2, Go 1.26.6,
+  darwin/arm64
 - Local NVMe SSD, APFS, via `b.TempDir()`
-- 10,000 iterations per benchmark, fixed rather than time-based so the three
-  policies are directly comparable
-- 100-byte values, 6–10 byte keys, single goroutine, no competing I/O
+- 100-byte values, no competing I/O; medians reported where runs were repeated
+- **Run length depends on the benchmark.** fsync-bound benchmarks use a fixed
+  number of writes: 10,000 for one writer, and 33,000 per concurrent case
+  (about 2 minutes each), so p99 rests on hundreds of samples rather than a
+  handful. Fast benchmarks run for 2 seconds and are repeated. At ~1.5 µs a
+  write, 10,000 iterations is only 15 ms, which never gets past the machine
+  warming up — an earlier version of this table measured that way and
+  understated `SyncNever` by about 20%.
+- The concurrent benchmark overwrites a fixed set of 10,000 keys, so the keydir
+  stays the same size for the whole run. Percentiles are nearest-rank.
 
-Read these as a comparison between policies rather than as absolute throughput:
+Read these as comparisons rather than as absolute throughput:
 
 - **`Get` never touches the disk here.** Its 1,000-key working set is ~130 KB
-  and stays in the page cache for the whole run, so 793 ns is a memory read. A
+  and stays in the page cache for the whole run, so 378 ns is a memory read. A
   dataset larger than RAM would pay real I/O per lookup.
 - **`fsync` cost is a property of the storage.** On macOS Go issues
   `F_FULLFSYNC`, which waits for the drive to flush its own write cache. Linux's
   default `fsync` often returns earlier, so published numbers elsewhere are
   usually measuring a weaker guarantee.
-- **`ns/op` is a mean.** Under `SyncEveryN(100)`, 99 writes are fast and the
-  100th absorbs a full flush; the average hides a latency no single operation
-  actually experiences. Percentiles are not measured yet.
-- Single-threaded, against a database that starts empty each run.
+- **`ns/op` in the one-writer table is a mean.** Under `SyncEveryN(100)`, 99
+  writes are fast and the 100th absorbs a full flush; the average hides a
+  latency no single operation actually experiences. The concurrent-writer
+  tables report percentiles for that reason.
+- **No readers run during the concurrent-writer benchmark.** Reads alongside
+  writes, and the effect of Go's `RWMutex` making new reads wait behind a
+  queued writer, are not measured yet.
 
 ## Testing
 
