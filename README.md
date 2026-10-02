@@ -138,7 +138,7 @@ folds them together.
 older record for its key is gone too, and that is not yet checked — so merge
 copies all of them forward, every time, and **space held by deletions is never
 reclaimed**. Delete-heavy data ends up with merged files that are mostly
-tombstones.
+tombstones — the load test below measures what that costs.
 
 **There is no trigger.** Merge rewrites every sealed file whether or not there is
 anything to reclaim, so merging twice in a row does the second pass for nothing.
@@ -586,8 +586,47 @@ Read these as comparisons rather than as absolute throughput:
   latency no single operation actually experiences. The concurrent-writer
   tables report percentiles for that reason.
 - **No readers run during the concurrent-writer benchmark.** Reads alongside
-  writes, and the effect of Go's `RWMutex` making new reads wait behind a
-  queued writer, are not measured yet.
+  writes are measured by the load test below.
+
+## Load test
+
+`cmd/loadtest-max` drives the database through its public API for 10 minutes:
+16 goroutines, 100,000 keys with 100-byte values, 80% reads / 15% puts / 5%
+deletes, a merge every 30 seconds, 64 MB files. It reports throughput and
+latency every 10 seconds, and the raw results are in `bench/results/`.
+
+```sh
+go run ./cmd/loadtest-max -sync never
+go run ./cmd/loadtest-max -sync every -sync-every 100
+```
+
+| | `SyncNever` | `SyncEveryN(100)` |
+|---|---:|---:|
+| throughput | 562,000 ops/s | 88,000 ops/s |
+| read p50 / p99 / p999 | 0.96 µs / 18 µs / 41 µs | 4.1 µs / 147 µs / 3.4 ms |
+| write p50 / p99 | 6.7 µs / 1.2 ms | 31 µs / 5.2 ms |
+| disk at peak (live data ~9.4 MB) | 2,763 MB | 403 MB |
+| share of the run with a merge running | 98% | 95% |
+
+A second `SyncNever` run agreed within 6%.
+
+**Tombstones dominate under deletes.** Merge copies every tombstone forward
+(see Compaction), and the `SyncNever` run left about 19 million of them. Each
+merge therefore took longer than the last — 21 s at first, 97 s by the end — so
+a merge was almost always running, and the disk never settled: even straight
+after a merge it roughly tripled over the run, from 544 MB to 1,528 MB. Of the
+592 MB left after a final merge, about 95% was tombstones.
+
+**A sync stalls readers too.** Under `SyncEveryN(100)`, every 100th write holds
+the lock through an fsync of about 5 ms, and reads arriving meanwhile wait for
+it. That is why read p999 stays at 3.1–3.9 ms in every 10-second window.
+
+**The latencies are optimistic.** Each client waits for its answer before
+sending the next request, so during a stall it stops sending, and the stall is
+counted once per client rather than once per request that would have arrived
+(*coordinated omission*). It is also one machine (the M5 MacBook Air above), one
+`SyncEveryN(100)` run, and 16 clients chosen rather than measured as the point
+where throughput stops growing.
 
 ## Testing
 
