@@ -1,0 +1,89 @@
+cooperdb load test: max
+  16 clients · 100,000 keys · 100-byte values · mix 80/15/5 (read/put/delete) · uniform keys
+  sync every100 · 64 MB files · merge every 30s
+  1m0s warm-up, then 10m0s measured, reported every 10s
+  rate: as fast as possible
+  go1.26.6 darwin/arm64, 10 CPUs · database in /var/folders/zp/s43t09v90g92pyct29dz_1tc0000gn/T/cooperdb-load-1924710043
+  results: bench/results/max-sync-every100-20261002-144739.csv and .txt
+
+preloaded 100,000 keys in 4.302s
+
+  time phase  |    reads/s   hit%     p50     p99    p999     max |  writes/s     p50     p99    p999     max |  disk MB  merge | gc
+   10s warmup |     59,812  88.0%   5.1µs   164µs   3.9ms   7.8ms |    15,056    45µs   5.2ms   5.8ms   8.5ms |       28      - | 15, 197µs
+   20s warmup |     60,578  78.0%   5.1µs   164µs   3.9ms   8.1ms |    15,090    41µs   5.2ms   5.8ms   9.1ms |       43      - | 13, 164µs
+   30s warmup |     62,931  75.7%   5.1µs   147µs   3.9ms   9.4ms |    15,738    37µs   5.2ms   5.8ms    11ms |       59      - | 13, 197µs
+   40s warmup |     62,929  75.2%   5.1µs   147µs   3.9ms   7.6ms |    15,690    37µs   5.2ms   5.8ms    11ms |       75   0.0s | 14, 3.7ms
+   50s warmup |     62,972  74.9%   5.1µs   147µs   3.9ms   7.0ms |    15,793    37µs   5.2ms   6.3ms   8.5ms |       91      - | 13, 2.6ms
+   60s warmup |     61,657  75.1%   5.1µs   164µs   3.9ms    12ms |    15,408    41µs   5.2ms   5.8ms    15ms |      106   0.0s | 13, 164µs
+   70s run    |     67,766  75.1%   4.1µs   164µs   3.7ms   7.2ms |    16,967    33µs   5.2ms   5.8ms   8.2ms |      125  10.0s | 20, 164µs
+   80s run    |     68,187  75.1%   4.6µs   147µs   3.4ms   7.5ms |    17,092    37µs   5.2ms   5.8ms    13ms |      144  10.0s | 20, 164µs
+   90s run    |     62,601  75.0%   5.1µs   164µs   3.9ms    12ms |    15,649    41µs   5.2ms   5.8ms    13ms |       96   2.7s | 15, 164µs
+  100s run    |     70,953  75.0%   4.6µs   147µs   3.1ms   6.4ms |    17,720    37µs   4.7ms   5.2ms   8.1ms |      116  10.0s | 21, 197µs
+  110s run    |     65,817  75.1%   4.6µs   164µs   3.4ms   5.5ms |    16,391    41µs   5.2ms   5.8ms   9.1ms |      135  10.0s | 19, 197µs
+  120s run    |     60,655  75.1%   4.6µs   164µs   3.9ms   9.6ms |    15,169    41µs   5.2ms   6.3ms    14ms |       87   6.9s | 16, 197µs
+  130s run    |     68,609  75.3%   4.6µs   164µs   3.4ms    13ms |    17,109    37µs   4.7ms   5.8ms    14ms |      106  10.0s | 20, 164µs
+  140s run    |     71,403  74.9%   4.1µs   147µs   3.1ms   4.4ms |    17,838    33µs   4.7ms   5.2ms   8.3ms |      126  10.0s | 21, 164µs
+  150s run    |     66,759  75.0%   4.6µs   147µs   3.7ms   6.9ms |    16,641    37µs   5.2ms   5.8ms    11ms |       80   8.7s | 19, 2.6ms
+  160s run    |     72,263  75.1%   4.6µs   147µs   3.1ms   6.8ms |    18,038    33µs   4.7ms   5.8ms   7.8ms |      100  10.0s | 21, 164µs
+  170s run    |     69,790  75.1%   4.6µs   164µs   3.1ms   6.6ms |    17,390    37µs   4.7ms   5.8ms   8.4ms |      120  10.0s | 20, 164µs
+  180s run    |     72,235  75.0%   4.6µs   131µs   3.1ms   5.8ms |    18,079    31µs   4.7ms   5.8ms   9.4ms |      151  10.0s | 21, 164µs
+  190s run    |     68,269  74.9%   4.1µs   131µs   3.9ms   8.0ms |    17,049    29µs   5.2ms   5.8ms    16ms |      108  10.0s | 20, 2.6ms
+  200s run    |     66,094  75.0%   4.6µs   147µs   3.9ms   7.6ms |    16,441    37µs   5.2ms   6.3ms    11ms |      108   1.1s | 15, 131µs
+  210s run    |     60,804  75.0%   5.1µs   164µs   3.9ms    25ms |    15,199    41µs   5.2ms   6.3ms    26ms |      124   0.0s | 12, 164µs
+  220s run    |     59,995  74.9%   4.6µs   180µs   3.9ms   8.3ms |    14,961    41µs   5.2ms   5.8ms    10ms |      140  10.0s | 18, 164µs
+  230s run    |     64,652  74.9%   4.1µs   164µs   3.9ms    13ms |    16,158    37µs   5.2ms   6.3ms    14ms |      159  10.0s | 19, 4.2ms
+  240s run    |     74,036  74.9%   3.8µs   131µs   3.4ms   7.4ms |    18,430    29µs   4.7ms   5.8ms    10ms |      188  10.0s | 21, 197µs
+  250s run    |     69,805  74.9%   3.8µs   147µs   3.7ms    11ms |    17,390    31µs   5.2ms   6.3ms    13ms |      133  10.0s | 21, 164µs
+  260s run    |     69,636  75.1%   4.1µs   164µs   3.4ms   7.3ms |    17,360    33µs   5.2ms   5.8ms   8.1ms |      153  10.0s | 21, 131µs
+  270s run    |     69,749  75.1%   4.1µs   147µs   3.4ms   7.2ms |    17,429    33µs   5.2ms   5.8ms   8.8ms |      177  10.0s | 20, 3.1ms
+  280s run    |     77,722  75.1%   2.8µs   106µs   3.4ms   9.5ms |    19,429    20µs   5.2ms   5.8ms    16ms |      128  10.0s | 24, 4.2ms
+  290s run    |     67,847  75.1%   4.6µs   164µs   3.4ms   5.9ms |    16,981    37µs   4.7ms   5.8ms    15ms |      147  10.0s | 19, 197µs
+  300s run    |     68,174  75.0%   4.6µs   147µs   3.4ms   7.7ms |    17,040    37µs   5.2ms   5.8ms   9.0ms |      166  10.0s | 20, 262µs
+  310s run    |     74,888  74.9%   3.3µs   115µs   3.7ms   7.2ms |    18,682    23µs   5.2ms   5.8ms   8.0ms |      205  10.0s | 23, 3.7ms
+  320s run    |     71,216  75.1%   4.1µs   147µs   3.4ms   7.6ms |    17,821    31µs   5.2ms   5.8ms   8.5ms |      141  10.0s | 21, 2.6ms
+  330s run    |     69,746  75.1%   4.6µs   147µs   3.4ms   7.3ms |    17,435    37µs   4.7ms   5.8ms    13ms |      160  10.0s | 20, 197µs
+  340s run    |     71,525  75.0%   4.1µs   147µs   3.4ms    14ms |    17,920    31µs   5.2ms   5.8ms   8.8ms |      187  10.0s | 21, 3.1ms
+  350s run    |     67,851  75.1%   4.1µs   131µs   3.9ms   6.1ms |    16,966    31µs   5.2ms   5.8ms   9.1ms |      221  10.0s | 20, 3.1ms
+  360s run    |     69,511  75.1%   3.8µs   147µs   3.7ms    11ms |    17,340    29µs   5.2ms   5.8ms    13ms |      152  10.0s | 21, 131µs
+  370s run    |     69,396  75.1%   4.6µs   147µs   3.1ms   7.6ms |    17,411    33µs   4.7ms   5.8ms    18ms |      172  10.0s | 20, 197µs
+  380s run    |     71,215  75.1%   3.8µs   147µs   3.4ms   6.5ms |    17,840    31µs   5.2ms   5.8ms    10ms |      199  10.0s | 21, 164µs
+  390s run    |     77,722  75.1%   2.6µs    98µs   3.7ms   8.1ms |    19,428    18µs   5.2ms   5.8ms    11ms |      241  10.0s | 24, 131µs
+  400s run    |     66,787  74.9%   4.1µs   147µs   3.7ms   8.2ms |    16,741    33µs   5.2ms   5.8ms   9.4ms |      165  10.0s | 20, 197µs
+  410s run    |     69,742  75.1%   4.1µs   147µs   3.4ms   7.5ms |    17,439    33µs   5.2ms   5.8ms   9.1ms |      185  10.0s | 20, 164µs
+  420s run    |     73,889  74.8%   3.6µs   131µs   3.4ms   7.0ms |    18,379    29µs   4.7ms   5.8ms    11ms |      212  10.0s | 21, 2.6ms
+  430s run    |     75,785  74.9%   3.1µs   106µs   3.7ms    13ms |    18,952    20µs   5.2ms   6.3ms    20ms |      252  10.0s | 23, 3.7ms
+  440s run    |     74,924  75.0%   2.8µs   115µs   3.7ms   8.0ms |    18,719    23µs   5.2ms   6.3ms   9.0ms |      179  10.0s | 22, 2.6ms
+  450s run    |     69,544  75.1%   4.1µs   147µs   3.4ms   7.7ms |    17,358    33µs   5.2ms   5.8ms   8.6ms |      199  10.0s | 20, 164µs
+  460s run    |     71,708  74.9%   3.8µs   147µs   3.4ms    10ms |    17,970    31µs   4.7ms   5.8ms    14ms |      223  10.0s | 21, 3.1ms
+  470s run    |     77,347  75.0%   3.6µs   106µs   3.4ms   6.9ms |    19,380    23µs   4.7ms   5.8ms    12ms |      262  10.0s | 23, 3.1ms
+  480s run    |     68,569  75.1%   4.6µs   131µs   3.7ms   7.6ms |    17,176    31µs   5.2ms   5.8ms    12ms |      296  10.0s | 20, 164µs
+  490s run    |     65,609  75.0%   4.1µs   164µs   3.7ms    15ms |    16,435    37µs   5.2ms   6.3ms    16ms |      210  10.0s | 19, 164µs
+  500s run    |     74,016  74.8%   4.1µs   147µs   3.1ms   6.6ms |    18,473    31µs   4.7ms   5.2ms   8.3ms |      231  10.0s | 21, 164µs
+  510s run    |     72,136  75.1%   4.6µs   131µs   3.1ms   7.6ms |    18,074    31µs   4.7ms   5.8ms   8.5ms |      257  10.0s | 20, 229µs
+  520s run    |     80,631  74.9%   2.8µs    98µs   3.4ms    12ms |    20,230    20µs   4.7ms   5.8ms    15ms |      300  10.0s | 25, 3.7ms
+  530s run    |     79,313  74.8%   2.8µs    98µs   3.4ms   6.1ms |    19,910    20µs   5.2ms   5.8ms   8.3ms |      341  10.0s | 23, 4.2ms
+  540s run    |     71,059  74.9%   4.6µs   147µs   3.1ms   7.1ms |    17,794    33µs   4.7ms   5.2ms    13ms |      361  10.0s | 21, 164µs
+  550s run    |     72,366  74.9%   4.1µs   147µs   3.1ms   7.4ms |    18,126    31µs   4.7ms   5.8ms    10ms |      382  10.0s | 21, 164µs
+  560s run    |     72,827  75.1%   3.8µs   147µs   3.1ms    10ms |    18,238    31µs   4.7ms   5.8ms    11ms |      224  10.0s | 21, 3.1ms
+  570s run    |     74,145  75.1%   4.1µs   147µs   3.1ms    11ms |    18,545    31µs   4.2ms   5.2ms    16ms |      245  10.0s | 21, 164µs
+  580s run    |     77,545  75.0%   3.8µs   115µs   3.1ms    10ms |    19,340    25µs   4.7ms   5.8ms    12ms |      280  10.0s | 22, 131µs
+  590s run    |     79,318  74.9%   3.1µs    98µs   3.1ms   6.3ms |    19,833    20µs   4.7ms   5.8ms   7.9ms |      322  10.0s | 23, 3.1ms
+  600s run    |     79,600  74.8%   3.1µs    98µs   3.4ms    14ms |    19,879    20µs   5.2ms   6.3ms    15ms |      364  10.0s | 24, 2.6ms
+  610s run    |     66,018  74.9%   4.6µs   164µs   3.7ms    16ms |    16,470    37µs   5.2ms   6.3ms    16ms |      383  10.0s | 19, 197µs
+  620s run    |     69,942  74.9%   4.1µs   147µs   3.1ms   6.6ms |    17,503    33µs   5.2ms   5.8ms   8.5ms |      403  10.0s | 20, 3.1ms
+  630s run    |     60,360  74.9%   4.6µs   180µs   3.7ms    13ms |    15,116    45µs   5.2ms   6.3ms    13ms |      232  10.0s | 17, 164µs
+  640s run    |     60,331  75.1%   4.6µs   180µs   3.7ms   8.1ms |    15,107    45µs   5.2ms   5.8ms    33ms |      249  10.0s | 16, 131µs
+  650s run    |     60,143  75.2%   4.6µs   180µs   3.7ms   7.6ms |    15,051    45µs   5.2ms   5.8ms   8.7ms |      266  10.0s | 17, 164µs
+  660s run    |     71,330  75.0%   3.1µs   115µs   3.4ms    31ms |    17,758    23µs   5.2ms   5.8ms    32ms |      300  10.0s | 21, 131µs
+
+== summary: 10m0s measured ==
+operations      42,119,018 reads (75.0% found), 10,528,168 writes (7,896,292 puts, 2,631,876 deletes)
+throughput      70,198 reads/s, 17,546 writes/s, 87,745 ops/s in total
+read latency    p50 4.1µs · p99 147µs · p999 3.4ms · max 31ms   (found: p99 147µs · not found: p99 147µs)
+write latency   p50 31µs · p99 5.2ms · p999 5.8ms · max 33ms   (puts: p99 5.2ms · deletes: p99 5.2ms)
+merges          16 in the whole run, each 254µs to 74.15s (median 36.28s); running 95% of the measured time
+disk            live data 9.4 MB; on disk peak 403 MB (43.0x live), mean 202 MB (21.5x)
+final merge     161 MB -> 103 MB in 5.26s; still 11.0x live
+gc              1215 cycles, worst pause 4.2ms
+heat check      fewer than two merge-free windows, so heat cannot be told apart from merging
+results         bench/results/max-sync-every100-20261002-144739.csv, bench/results/max-sync-every100-20261002-144739.txt
